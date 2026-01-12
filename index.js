@@ -1,0 +1,496 @@
+
+import 'dotenv/config'; // Load env vars
+import express from 'express';
+import cors from 'cors';
+import bodyParser from 'body-parser';
+import {
+  generateRegistrationOptions,
+  verifyRegistrationResponse,
+  generateAuthenticationOptions,
+  verifyAuthenticationResponse,
+} from '@simplewebauthn/server';
+import crypto from 'crypto';
+import pg from 'pg'; // PostgreSQL
+import https from 'https';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const { Pool } = pg;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(cors());
+app.use(bodyParser.json());
+
+// Initialize Postgres
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// Global settings
+const rpName = 'FIDO Check-in System';
+
+const getRpConfig = (req) => {
+  const origin = req.get('origin');
+  let rpID = req.hostname;
+
+  if (origin) {
+    try {
+      const url = new URL(origin);
+      rpID = url.hostname;
+    } catch (e) {
+      console.warn('Failed to parse origin:', origin);
+    }
+  }
+
+  return { rpID, origin: origin || `http://${rpID}:5173` };
+};
+
+// --- HELPER ISOBUE ---
+const isoBase64URL = {
+  fromBuffer: (buffer) => {
+    if (!buffer) return '';
+    const base64 = Buffer.from(buffer).toString('base64');
+    return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+  },
+  toBuffer: (base64url) => {
+    if (!base64url) return Buffer.alloc(0);
+    const base64 = base64url.replace(/-/g, '+').replace(/_/g, '/');
+    return Buffer.from(base64, 'base64');
+  }
+}
+
+// --- DB HELPERS (ASYNC for Postgres) ---
+
+async function getOrCreateUser(username) {
+  const res = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+  let user = res.rows[0];
+
+  if (!user) {
+    const userId = crypto.randomBytes(16); // Buffer
+    await pool.query('INSERT INTO users (username, id) VALUES ($1, $2)', [username, userId]);
+    user = { username, id: userId, currentChallenge: null };
+    await pool.query('INSERT INTO checks (username, status) VALUES ($1, $2)', [username, 'out']);
+  }
+  return user;
+}
+
+async function getUserAuthenticators(username) {
+  const res = await pool.query('SELECT * FROM authenticators WHERE username = $1', [username]);
+  return res.rows.map(row => ({
+    credentialID: row.credentialID, // Buffer (BYTEA)
+    credentialPublicKey: row.credentialPublicKey, // Buffer (BYTEA)
+    counter: row.counter,
+    transports: JSON.parse(row.transports || '[]')
+  }));
+}
+
+async function saveAuthenticator(username, authenticator) {
+  await pool.query(
+    `INSERT INTO authenticators ("credentialID", username, "credentialPublicKey", counter, transports)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [
+      authenticator.credentialID,
+      username,
+      authenticator.credentialPublicKey,
+      authenticator.counter,
+      JSON.stringify(authenticator.transports)
+    ]
+  );
+}
+
+async function updateAuthenticatorCounter(credentialID, newCounter) {
+  await pool.query('UPDATE authenticators SET counter = $1 WHERE "credentialID" = $2', [newCounter, credentialID]);
+}
+
+async function getCheckStatus(username) {
+  const res = await pool.query('SELECT status, timestamp FROM checks WHERE username = $1', [username]);
+  return res.rows[0] || { status: 'out', timestamp: null };
+}
+
+async function updateCheckStatus(username, status, location = null) {
+  const timestamp = new Date().toISOString();
+  // UPSERT for checks table
+  await pool.query(`
+    INSERT INTO checks (username, status, timestamp) 
+    VALUES ($1, $2, $3)
+    ON CONFLICT (username) 
+    DO UPDATE SET status = $2, timestamp = $3
+  `, [username, status, timestamp]);
+
+  // Append to audit_logs
+  await pool.query(
+    'INSERT INTO audit_logs (username, action, timestamp, location) VALUES ($1, $2, $3, $4)',
+    [username, status, timestamp, location]
+  );
+}
+
+async function updateUserChallenge(username, challenge) {
+  await pool.query('UPDATE users SET "currentChallenge" = $1 WHERE username = $2', [challenge, username]);
+}
+
+// --- ENDPOINTS ---
+
+app.get('/', (req, res) => { res.send('FIDO Server Running (Supabase/Postgres)'); });
+
+
+// REGISTRATION
+app.post('/api/register/begin', async (req, res) => {
+  try {
+    const { username } = req.body;
+    if (!username) return res.status(400).json({ error: 'Username required' });
+
+    const user = await getOrCreateUser(username);
+    const rpConfig = getRpConfig(req);
+
+    const allAuthsRes = await pool.query('SELECT "credentialID", transports FROM authenticators');
+    const allAuthenticators = allAuthsRes.rows.map(row => ({
+      credentialID: row.credentialID,
+      transports: JSON.parse(row.transports || '[]')
+    }));
+
+    const options = await generateRegistrationOptions({
+      rpName,
+      rpID: rpConfig.rpID || 'localhost',
+      userID: new Uint8Array(user.id),
+      userName: user.username,
+      attestationType: 'direct',
+      excludeCredentials: allAuthenticators.map(auth => ({
+        id: isoBase64URL.fromBuffer(auth.credentialID),
+        type: 'public-key',
+        transports: auth.transports,
+      })),
+      authenticatorSelection: {
+        residentKey: 'required',
+        userVerification: 'preferred',
+        authenticatorAttachment: 'cross-platform',
+      },
+    });
+
+    await updateUserChallenge(username, options.challenge);
+    res.json(options);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/register/finish', async (req, res) => {
+  const { username, body } = req.body;
+  const user = await getOrCreateUser(username);
+
+  try {
+    const { rpID, origin } = getRpConfig(req);
+    const verification = await verifyRegistrationResponse({
+      response: body,
+      expectedChallenge: user.currentChallenge,
+      expectedOrigin: origin,
+      expectedRPID: rpID,
+    });
+
+    const { verified, registrationInfo } = verification;
+
+    if (verified && registrationInfo) {
+      let { credentialPublicKey, credentialID, counter } = registrationInfo;
+
+      if (!credentialID && registrationInfo.credential) {
+        if (registrationInfo.credential.id) credentialID = registrationInfo.credential.id;
+        if (registrationInfo.credential.publicKey) credentialPublicKey = registrationInfo.credential.publicKey;
+        if (registrationInfo.credential.counter) counter = registrationInfo.credential.counter;
+      }
+
+      if (!credentialID) throw new Error('credentialID is null');
+
+      let credIdBuffer;
+      if (typeof credentialID === 'string') {
+        credIdBuffer = isoBase64URL.toBuffer(credentialID);
+      } else {
+        credIdBuffer = Buffer.from(credentialID);
+      }
+
+      // Check collision
+      const existingAuthRes = await pool.query('SELECT * FROM authenticators WHERE "credentialID" = $1', [credIdBuffer]);
+      if (existingAuthRes.rows.length > 0) {
+        throw new Error('This card is already registered to a user.');
+      }
+
+      const pubKeyBuffer = Buffer.from(credentialPublicKey);
+
+      await saveAuthenticator(username, {
+        credentialID: credIdBuffer,
+        credentialPublicKey: pubKeyBuffer,
+        counter,
+        transports: body.response.transports
+      });
+
+      await updateUserChallenge(username, null);
+      res.json({ verified: true });
+    } else {
+      res.status(400).json({ verified: false, error: 'Verification returned false' });
+    }
+  } catch (error) {
+    console.error(error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+
+// AUTHENTICATION
+app.post('/api/login/begin', async (req, res) => {
+  const { username } = req.body;
+  let allowCredentials = [];
+  let user;
+
+  if (username) {
+    user = await getOrCreateUser(username);
+    const authenticators = await getUserAuthenticators(username);
+    allowCredentials = authenticators.map(dev => ({
+      id: isoBase64URL.fromBuffer(dev.credentialID),
+      type: 'public-key',
+      transports: dev.transports,
+    }));
+  }
+
+  const { rpID } = getRpConfig(req);
+  const options = await generateAuthenticationOptions({
+    rpID,
+    allowCredentials,
+    userVerification: 'preferred',
+  });
+
+  if (user) {
+    await updateUserChallenge(username, options.challenge);
+  } else {
+    pendingChallenges.set(options.challenge, { timestamp: Date.now() });
+  }
+
+  res.json(options);
+});
+
+const pendingChallenges = new Map();
+
+app.post('/api/login/finish', async (req, res) => {
+  const { username, body, action, location } = req.body;
+  let user;
+  let currentChallenge;
+
+  try {
+    if (username) {
+      user = await getOrCreateUser(username);
+      currentChallenge = user.currentChallenge;
+    } else {
+      // Usernameless
+      const response = body.response;
+      if (!response.userHandle) throw new Error('User handle missing in response');
+
+      const userHandleBuffer = isoBase64URL.toBuffer(response.userHandle);
+      const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [userHandleBuffer]);
+      user = userRes.rows[0];
+
+      if (!user) throw new Error('User not found from userHandle');
+
+      const clientData = JSON.parse(Buffer.from(body.response.clientDataJSON, 'base64url').toString('utf8'));
+      const returnedChallenge = clientData.challenge;
+
+      if (pendingChallenges.has(returnedChallenge)) {
+        currentChallenge = returnedChallenge;
+        pendingChallenges.delete(returnedChallenge);
+      } else {
+        throw new Error('Challenge not found or expired');
+      }
+    }
+
+    const authenticators = await getUserAuthenticators(user.username);
+    const dbAuthenticator = authenticators.find(dev => {
+      return isoBase64URL.fromBuffer(dev.credentialID) === body.id;
+    });
+
+    if (!dbAuthenticator) throw new Error('Authenticator not found');
+
+    const { rpID, origin } = getRpConfig(req);
+    const verification = await verifyAuthenticationResponse({
+      response: body,
+      expectedChallenge: currentChallenge,
+      expectedOrigin: origin,
+      expectedRPID: rpID,
+      credential: {
+        id: dbAuthenticator.credentialID,
+        publicKey: dbAuthenticator.credentialPublicKey,
+        counter: dbAuthenticator.counter || 0,
+        transports: dbAuthenticator.transports,
+      },
+    });
+
+    const { verified, authenticationInfo } = verification;
+
+    if (verified) {
+      await updateAuthenticatorCounter(dbAuthenticator.credentialID, authenticationInfo.newCounter);
+      if (username) await updateUserChallenge(username, null);
+
+      let status = 'out';
+      let message = 'Authenticated';
+
+      if (action === 'toggle') {
+        const check = await getCheckStatus(user.username);
+        status = check.status === 'out' ? 'in' : 'out';
+        await updateCheckStatus(user.username, status, location);
+        message = status === 'in' ? `Welcome back ${user.username}! Checked In.` : `Goodbye ${user.username}! Checked Out.`;
+      }
+
+      res.json({ verified: true, status, message, username: user.username });
+    } else {
+      res.status(400).json({ verified: false });
+    }
+
+  } catch (error) {
+    console.error(error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+
+// ADMIN
+app.get('/api/admin/data', async (req, res) => {
+  try {
+    const usersRes = await pool.query('SELECT * FROM users');
+    const checksRes = await pool.query('SELECT * FROM checks');
+    const authsRes = await pool.query('SELECT username, counter, "credentialID" FROM authenticators');
+
+    const users = usersRes.rows;
+    const checks = checksRes.rows;
+    const auths = authsRes.rows;
+
+    const data = users.map(u => {
+      const check = checks.find(c => c.username === u.username) || { status: 'out', timestamp: null };
+      const userAuths = auths.filter(a => a.username === u.username);
+      return {
+        username: u.username,
+        status: check.status,
+        lastSeen: check.timestamp,
+        deviceCount: userAuths.length,
+        totalLogins: userAuths.reduce((acc, curr) => acc + (curr.counter || 0), 0)
+      };
+    });
+
+    res.json(data);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ADMIN - AUDIT LOGS
+app.get('/api/admin/audit/:username', async (req, res) => {
+  const { username } = req.params;
+  try {
+    const resLogs = await pool.query('SELECT * FROM audit_logs WHERE username = $1 ORDER BY timestamp DESC LIMIT 50', [username]);
+    res.json(resLogs.rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ADMIN - EXPORT
+app.get('/api/admin/export', async (req, res) => {
+  try {
+    const resLogs = await pool.query('SELECT * FROM audit_logs ORDER BY timestamp DESC');
+    res.json(resLogs.rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE USER
+app.delete('/api/admin/user/:username', async (req, res) => {
+  const { username } = req.params;
+  try {
+    await pool.query('BEGIN');
+    await pool.query('DELETE FROM authenticators WHERE username = $1', [username]);
+    await pool.query('DELETE FROM checks WHERE username = $1', [username]);
+    await pool.query('DELETE FROM audit_logs WHERE username = $1', [username]);
+    const userDel = await pool.query('DELETE FROM users WHERE username = $1', [username]);
+    await pool.query('COMMIT');
+    if (userDel.rowCount > 0) res.json({ success: true, message: `User ${username} deleted.` });
+    else res.status(404).json({ error: 'User not found' });
+  } catch (e) {
+    await pool.query('ROLLBACK');
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// STATUS
+app.get('/api/status/:username', async (req, res) => {
+  const { username } = req.params;
+  const status = await getCheckStatus(username);
+  res.json(status);
+});
+
+// STATIONS
+app.get('/api/admin/stations', async (req, res) => {
+  try {
+    const resStations = await pool.query('SELECT * FROM stations ORDER BY created_at DESC');
+    res.json(resStations.rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/stations', async (req, res) => {
+  const { name, description } = req.body;
+  if (!name) return res.status(400).json({ error: 'Station Name required' });
+  try {
+    await pool.query(
+      'INSERT INTO stations (name, description, created_at) VALUES ($1, $2, $3)',
+      [name, description, new Date().toISOString()]
+    );
+    res.json({ success: true });
+  } catch (e) {
+    if (e.message.includes('unique constraint') || e.code === '23505') {
+      return res.status(409).json({ error: 'Station name already exists' });
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/admin/stations/:name', async (req, res) => {
+  const { name } = req.params;
+  try {
+    await pool.query('DELETE FROM stations WHERE name = $1', [name]);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// HTTPS Setup (Conditional for Local Dev - Vercel handles HTTPS automatically)
+let httpsOptions = {};
+try {
+  httpsOptions = {
+    key: fs.readFileSync(path.join(__dirname, '../key.pem')),
+    cert: fs.readFileSync(path.join(__dirname, '../cert.pem'))
+  };
+} catch (e) { }
+
+if (process.env.VERCEL) {
+  console.log('Running in Vercel environment (Serverless)');
+} else {
+  // Local Dev
+  if (httpsOptions.key) {
+    https.createServer(httpsOptions, app).listen(PORT, () => {
+      console.log(`SECURE Server listening on port ${PORT}`);
+    });
+  } else {
+    app.listen(PORT, () => {
+      console.log(`Server listening on port ${PORT} (HTTP only)`);
+    });
+  }
+}
+
+export default app;
