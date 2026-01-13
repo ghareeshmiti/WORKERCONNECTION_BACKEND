@@ -619,6 +619,43 @@ app.post('/api/register/establishment', async (req, res) => {
   }
 });
 
+});
+
+// ACTIVATE ESTABLISHMENT (APPROVE)
+app.post('/api/admin/approve-establishment', async (req, res) => {
+  const { establishmentId, cardReaderId, approvedBy } = req.body;
+
+  if (!establishmentId || !cardReaderId) {
+    return res.status(400).json({ success: false, message: 'Missing required fields' });
+  }
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(`
+      UPDATE establishments 
+      SET 
+        is_approved = true,
+        card_reader_id = $1,
+        approved_by = $2,
+        approved_at = NOW(),
+        updated_at = NOW()
+      WHERE id = $3
+      RETURNING id
+    `, [cardReaderId, approvedBy || null, establishmentId]);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, message: 'Establishment not found' });
+    }
+
+    res.json({ success: true, message: 'Establishment approved successfully' });
+  } catch (error) {
+    console.error('Approval Error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 // DELETE USER
 app.delete('/api/admin/user/:username', async (req, res) => {
   const { username } = req.params;
