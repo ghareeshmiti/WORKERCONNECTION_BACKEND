@@ -539,6 +539,86 @@ app.post('/api/register/department', async (req, res) => {
   }
 });
 
+// REGISTER ESTABLISHMENT
+app.post('/api/register/establishment', async (req, res) => {
+  const {
+    name, code, description, establishmentType, email, password, phone,
+    state, district, mandal, pincode, addressLine,
+    licenseNumber, departmentId, constructionType, projectName, contractorName,
+    estimatedWorkers, startDate, expectedEndDate
+  } = req.body;
+
+  if (!email || !password || !name || !departmentId) {
+    return res.status(400).json({ success: false, message: 'Missing required fields' });
+  }
+
+  // Ensure Service Key is set
+  if (!supabaseAdmin) {
+    return res.status(500).json({ success: false, message: 'Server misconfiguration: Missing Admin Key' });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // 1. Check if email exists
+    const checkRes = await client.query('SELECT id FROM establishments WHERE email = $1', [email]);
+    if (checkRes.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'Email already registered' });
+    }
+
+    // 2. Create User in Supabase Auth
+    const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+      email: email,
+      password: password,
+      email_confirm: true,
+      user_metadata: { role: 'establishment' }
+    });
+
+    if (authError) {
+      await client.query('ROLLBACK');
+      console.error('Supabase Auth Error:', authError);
+      return res.status(400).json({ success: false, message: authError.message });
+    }
+
+    const userId = authData.user.id;
+
+    // 3. Insert into public.establishments
+    await client.query(`
+      INSERT INTO establishments (
+        id, department_id, name, code, description, establishment_type,
+        state, district, mandal, pincode, address_line, phone, email,
+        license_number, construction_type, project_name, contractor_name,
+        estimated_workers, start_date, expected_end_date,
+        is_active, created_at, updated_at
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6,
+        $7, $8, $9, $10, $11, $12, $13,
+        $14, $15, $16, $17,
+        $18, $19, $20,
+        true, NOW(), NOW()
+      )
+    `, [
+      userId, departmentId, name, code, description, establishmentType,
+      state, district, mandal, pincode, addressLine, phone, email,
+      licenseNumber, constructionType, projectName, contractorName,
+      estimatedWorkers || 0, startDate || null, expectedEndDate || null
+    ]);
+
+    await client.query('COMMIT');
+    res.json({ success: true, message: 'Establishment registered successfully' });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Establishment Registration error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 // DELETE USER
 app.delete('/api/admin/user/:username', async (req, res) => {
   const { username } = req.params;
