@@ -468,6 +468,76 @@ app.get('/api/admin/export', async (req, res) => {
   }
 });
 
+// REGISTER DEPARTMENT (Moved from Edge Function)
+app.post('/api/register/department', async (req, res) => {
+  const { name, code, email, password, phone, state, district, mandal, pincode, addressLine } = req.body;
+
+  if (!email || !password || !name) {
+    return res.status(400).json({ success: false, message: 'Missing required fields' });
+  }
+
+  try {
+    await pool.query('BEGIN');
+
+    // 1. Check if email exists in Departments
+    const checkRes = await pool.query('SELECT id FROM departments WHERE email = $1', [email]);
+    if (checkRes.rows.length > 0) {
+      await pool.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'Email already registered' });
+    }
+
+    // 2. Generate ID
+    const deptId = crypto.randomUUID();
+
+    // 3. Insert into public.departments
+    await pool.query(`
+      INSERT INTO departments (
+        id, name, code, state, district, mandal, pincode, address_line, phone, email, is_active, created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true, NOW(), NOW())
+    `, [deptId, name, code, state, district, mandal, pincode, addressLine, phone, email]);
+
+    // 4. Insert into auth.users (for Login)
+    // Ensure pgcrypto exists
+    await pool.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
+
+    await pool.query(`
+      INSERT INTO auth.users (
+        instance_id,
+        id,
+        aud,
+        role,
+        email,
+        encrypted_password,
+        email_confirmed_at,
+        raw_app_meta_data,
+        raw_user_meta_data,
+        created_at,
+        updated_at
+      ) VALUES (
+        '00000000-0000-0000-0000-000000000000',
+        $1,
+        'authenticated',
+        'authenticated',
+        $2,
+        crypt($3, gen_salt('bf')),
+        NOW(),
+        '{"provider":"email","providers":["email"]}',
+        '{}',
+        NOW(),
+        NOW()
+      )
+    `, [deptId, email, password]);
+
+    await pool.query('COMMIT');
+    res.json({ success: true, message: 'Department registered successfully' });
+
+  } catch (error) {
+    await pool.query('ROLLBACK');
+    console.error('Registration error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // DELETE USER
 app.delete('/api/admin/user/:username', async (req, res) => {
   const { username } = req.params;
