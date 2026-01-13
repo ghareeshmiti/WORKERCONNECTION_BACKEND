@@ -619,7 +619,7 @@ app.post('/api/register/establishment', async (req, res) => {
   }
 });
 
-});
+
 
 // ACTIVATE ESTABLISHMENT (APPROVE)
 app.post('/api/admin/approve-establishment', async (req, res) => {
