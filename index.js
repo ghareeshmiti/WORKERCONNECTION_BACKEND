@@ -482,65 +482,60 @@ app.post('/api/register/department', async (req, res) => {
     return res.status(400).json({ success: false, message: 'Missing required fields' });
   }
 
-  try {
-    await pool.query('BEGIN');
+  // Ensure Service Key is set
+  if (!supabaseAdmin) {
+    console.error('Missing SUPABASE_SERVICE_ROLE_KEY');
+    return res.status(500).json({ success: false, message: 'Server misconfiguration: Missing Admin Key' });
+  }
 
-    // 1. Check if email exists in Departments
-    const checkRes = await pool.query('SELECT id FROM departments WHERE email = $1', [email]);
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // 1. Check if email exists in Departments (Public Table)
+    const checkRes = await client.query('SELECT id FROM departments WHERE email = $1', [email]);
     if (checkRes.rows.length > 0) {
-      await pool.query('ROLLBACK');
+      await client.query('ROLLBACK');
       return res.status(400).json({ success: false, message: 'Email already registered' });
     }
 
-    // 2. Generate ID
-    const deptId = crypto.randomUUID();
+    // 2. Create User in Supabase Auth (Using Admin API to avoid SQL Trigger issues)
+    const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+      email: email,
+      password: password,
+      email_confirm: true, // Auto-confirm
+      user_metadata: { role: 'department' }
+    });
 
-    // 3. Insert into public.departments
-    await pool.query(`
+    if (authError) {
+      await client.query('ROLLBACK');
+      console.error('Supabase Auth Error:', authError);
+      return res.status(400).json({ success: false, message: authError.message });
+    }
+
+    const userId = authData.user.id;
+
+    // 3. Insert into public.departments (using the Auth ID as the Department ID for linkage)
+    await client.query(`
       INSERT INTO departments (
         id, name, code, state, district, mandal, pincode, address_line, phone, email, is_active, created_at, updated_at
       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true, NOW(), NOW())
-    `, [deptId, name, code, state, district, mandal, pincode, addressLine, phone, email]);
+    `, [userId, name, code, state, district, mandal, pincode, addressLine, phone, email]);
 
-    // 4. Insert into auth.users (for Login)
-    // Ensure pgcrypto exists
-    await pool.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
-
-    await pool.query(`
-      INSERT INTO auth.users (
-        instance_id,
-        id,
-        aud,
-        role,
-        email,
-        encrypted_password,
-        email_confirmed_at,
-        raw_app_meta_data,
-        raw_user_meta_data,
-        created_at,
-        updated_at
-      ) VALUES (
-        '00000000-0000-0000-0000-000000000000',
-        $1,
-        'authenticated',
-        'authenticated',
-        $2,
-        crypt($3, gen_salt('bf')),
-        NOW(),
-        '{"provider":"email","providers":["email"]}',
-        '{}',
-        NOW(),
-        NOW()
-      )
-    `, [deptId, email, password]);
-
-    await pool.query('COMMIT');
+    await client.query('COMMIT');
     res.json({ success: true, message: 'Department registered successfully' });
 
   } catch (error) {
-    await pool.query('ROLLBACK');
+    await client.query('ROLLBACK');
     console.error('Registration error:', error);
+    // Attempt cleanup
+    if (supabaseAdmin && error.message !== 'Email already registered') {
+      // await supabaseAdmin.auth.admin.deleteUser(userId); 
+    }
     res.status(500).json({ success: false, message: error.message });
+  } finally {
+    client.release();
   }
 });
 
