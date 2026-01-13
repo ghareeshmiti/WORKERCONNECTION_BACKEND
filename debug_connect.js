@@ -29,8 +29,23 @@ async function testParams() {
         try {
             await client.connect();
             console.log('SUCCESS! Connected.');
-            const res = await client.query('SELECT version()');
-            console.log('Version:', res.rows[0].version);
+            const res = await client.query('SELECT NOW()');
+            console.log('Connected successfully:', res.rows[0]);
+
+            const tables = await client.query(`
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public'
+    `);
+            console.log('Tables:', tables.rows.map(r => r.table_name));
+
+            const types = await client.query(`
+        SELECT typname 
+        FROM pg_type 
+        WHERE typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+    `);
+            console.log('Types:', types.rows.map(r => r.typname));
+
             await client.end();
             break; // Stop on first success
         } catch (e) {

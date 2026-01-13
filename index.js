@@ -75,8 +75,21 @@ async function getOrCreateUser(username) {
     const userId = crypto.randomBytes(16); // Buffer
     await pool.query('INSERT INTO users (username, id) VALUES ($1, $2)', [username, userId]);
     user = { username, id: userId, currentChallenge: null };
-    await pool.query('INSERT INTO checks (username, status) VALUES ($1, $2)', [username, 'out']);
   }
+
+  // Sync with Workers table (New Schema Support)
+  // Check if worker exists
+  const workerRes = await pool.query('SELECT id FROM workers WHERE worker_id = $1', [username]);
+  if (workerRes.rowCount === 0) {
+    // Create default worker profile
+    await pool.query(`
+          INSERT INTO workers 
+          (worker_id, first_name, last_name, state, district, is_active)
+          VALUES ($1, $2, $3, 'Telangana', 'Hyderabad', true)
+      `, [username, username, 'User']); // Defaulting Name to username, Location to Hyd
+    console.log(`Auto-created worker profile for ${username}`);
+  }
+
   return user;
 }
 
@@ -109,25 +122,73 @@ async function updateAuthenticatorCounter(credentialID, newCounter) {
 }
 
 async function getCheckStatus(username) {
+  // Try to get status from new schema first
+  try {
+    const workerRes = await pool.query('SELECT id FROM workers WHERE worker_id = $1', [username]);
+    if (workerRes.rows[0]) {
+      const lastEventRes = await pool.query(
+        'SELECT event_type, occurred_at FROM attendance_events WHERE worker_id = $1 ORDER BY occurred_at DESC LIMIT 1',
+        [workerRes.rows[0].id]
+      );
+      if (lastEventRes.rows[0]) {
+        const evt = lastEventRes.rows[0];
+        return {
+          status: evt.event_type === 'CHECK_IN' ? 'in' : 'out',
+          timestamp: evt.occurred_at
+        };
+      }
+    }
+  } catch (e) {
+    console.error("Error reading new schema status", e);
+  }
+
+  // Fallback to legacy checks table (if empty or migration issues)
   const res = await pool.query('SELECT status, timestamp FROM checks WHERE username = $1', [username]);
   return res.rows[0] || { status: 'out', timestamp: null };
 }
 
-async function updateCheckStatus(username, status, location = null) {
+async function updateCheckStatus(username, status, location = 'Unknown') {
   const timestamp = new Date().toISOString();
-  // UPSERT for checks table
+
+  // 1. Find Worker UUID from worker_id (username)
+  const workerRes = await pool.query('SELECT id FROM workers WHERE worker_id = $1', [username]);
+  const worker = workerRes.rows[0];
+
+  if (!worker) {
+    console.warn(`Worker profile not found for ${username}. Authentication successful but attendance NOT recorded.`);
+    return; // Or throw error?
+  }
+
+  // 2. Find mapped Establishment
+  const mappingRes = await pool.query(
+    'SELECT establishment_id FROM worker_mappings WHERE worker_id = $1 AND is_active = true',
+    [worker.id]
+  );
+  const establishmentId = mappingRes.rows[0]?.establishment_id || null;
+
+  // 3. Determine Event Type (CHECK_IN / CHECK_OUT)
+  // We can trust the passed 'status' if 'in' -> 'CHECK_IN', 'out' -> 'CHECK_OUT'
+  // logic in calling function already toggles it based on previous state. 
+  // Wait, previous state was from 'checks' table. We should now check 'attendance_daily_rollups' or 'attendance_events'.
+
+  const eventType = status === 'in' ? 'CHECK_IN' : 'CHECK_OUT';
+
+  // 4. Insert Event
+  await pool.query(`
+    INSERT INTO attendance_events 
+    (worker_id, event_type, establishment_id, occurred_at, region)
+    VALUES ($1, $2, $3, $4, $5)
+  `, [worker.id, eventType, establishmentId, timestamp, location]);
+
+  // Legacy support cleanup (optional, keeping valid for now)
+  /*
   await pool.query(`
     INSERT INTO checks (username, status, timestamp) 
     VALUES ($1, $2, $3)
     ON CONFLICT (username) 
     DO UPDATE SET status = $2, timestamp = $3
   `, [username, status, timestamp]);
-
-  // Append to audit_logs
-  await pool.query(
-    'INSERT INTO audit_logs (username, action, timestamp, location) VALUES ($1, $2, $3, $4)',
-    [username, status, timestamp, location]
-  );
+  */
 }
 
 async function updateUserChallenge(username, challenge) {
