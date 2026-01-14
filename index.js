@@ -801,7 +801,37 @@ app.get('/api/status/:username', async (req, res) => {
 });
 
 
-// REJECT WORKER
+// APPROVE WORKER
+app.put('/api/admin/workers/:id/approve', async (req, res) => {
+  const { id } = req.params;
+  // departmentId / establishmentId might be passed but for now we just activate logic
+  // "Assign Card" = activate the worker (worker_id is the card)
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE workers 
+       SET status = 'active', 
+           is_active = true, 
+           updated_at = NOW() 
+       WHERE worker_id = $1 OR id = $1
+       RETURNING *`,
+      [id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, message: 'Worker not found' });
+    }
+
+    res.json({ success: true, message: 'Worker approved and activated successfully', worker: result.rows[0] });
+  } catch (error) {
+    console.error('Approval Error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.put('/api/admin/workers/:id/reject', async (req, res) => {
   const { id } = req.params;
   const { reason } = req.body; // Expect a reason
