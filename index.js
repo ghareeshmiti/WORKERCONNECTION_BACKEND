@@ -208,12 +208,25 @@ async function updateCheckStatus(username, status, location = 'Unknown') {
     return; // Or throw error?
   }
 
-  // 2. Find mapped Establishment
-  const mappingRes = await pool.query(
-    'SELECT establishment_id FROM worker_mappings WHERE worker_id = $1 AND is_active = true',
-    [worker.id]
-  );
-  const establishmentId = mappingRes.rows[0]?.establishment_id || null;
+  // 2. Find Establishment (Resolve from Location Name first, then Mapping)
+  let establishmentId = null;
+
+  // Try to find establishment by Name (passed as location)
+  if (location && location !== 'Unknown') {
+    const estRes = await pool.query('SELECT id FROM establishments WHERE name = $1', [location]);
+    if (estRes.rows.length > 0) {
+      establishmentId = estRes.rows[0].id;
+    }
+  }
+
+  // Fallback: Check worker mapping
+  if (!establishmentId) {
+    const mappingRes = await pool.query(
+      'SELECT establishment_id FROM worker_mappings WHERE worker_id = $1 AND is_active = true',
+      [worker.id]
+    );
+    establishmentId = mappingRes.rows[0]?.establishment_id || null;
+  }
 
   // 3. Determine Event Type (CHECK_IN / CHECK_OUT)
   // We can trust the passed 'status' if 'in' -> 'CHECK_IN', 'out' -> 'CHECK_OUT'
