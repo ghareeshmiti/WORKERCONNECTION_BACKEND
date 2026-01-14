@@ -90,8 +90,8 @@ async function getOrCreateUser(username) {
     // Create default worker profile
     await pool.query(`
           INSERT INTO workers 
-          (worker_id, first_name, last_name, state, district, is_active)
-          VALUES ($1, $2, $3, 'Telangana', 'Hyderabad', true)
+          (worker_id, first_name, last_name, state, district, status, is_active)
+          VALUES ($1, $2, $3, 'Telangana', 'Hyderabad', 'new', true)
       `, [username, username, 'User']); // Defaulting Name to username, Location to Hyd
     console.log(`Auto-created worker profile for ${username}`);
   }
