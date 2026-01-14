@@ -602,6 +602,62 @@ app.post('/api/register/department', async (req, res) => {
   }
 });
 
+// PUBLIC WORKER REGISTRATION
+app.post('/api/public/register-worker', async (req, res) => {
+  const {
+    firstName, lastName, gender, dob, phone, aadhaarNumber,
+    state, district, mandal, village, pincode, addressLine,
+    eshramId, bocwId
+  } = req.body;
+
+  if (!firstName || !lastName || !phone || !aadhaarNumber || !district || !mandal) {
+    return res.status(400).json({ success: false, message: 'Missing required fields' });
+  }
+
+  const client = await pool.connect();
+  try {
+    // 1. Generate Worker ID
+    const { rows: countRows } = await client.query('SELECT count(*) FROM workers');
+    const count = parseInt(countRows[0].count, 10);
+    const workerId = `WKR${String(count + 1).padStart(8, '0')}`;
+
+    // 2. Insert into workers table
+    // Note: mapping to a department/establishment happens later via admin approval or separately.
+    // We set status='new' so it shows up in "Pending Approvals" for Department Admins.
+    // We need to infer department_id from location if possible, or leave null for now.
+    // For now, we will leave department_id NULL or try to match based on District.
+
+    // Let's try to find a department in this district to assign tentatively? 
+    // Or just insert with NO department and filter by district in the dashboard.
+    // The dashboard query filters by District, so we just need to ensure District is saved.
+
+    const aadhaarLastFour = aadhaarNumber.slice(-4);
+
+    await client.query(`
+          INSERT INTO workers (
+              worker_id, first_name, last_name, gender, date_of_birth, phone,
+              aadhaar_number, aadhaar_last_four,
+              state, district, mandal, village, pincode, address_line,
+              eshram_id, bocw_id,
+              status, is_active, created_at, updated_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'new', true, NOW(), NOW())
+      `, [
+      workerId, firstName, lastName, gender, dob, phone,
+      aadhaarNumber, aadhaarLastFour,
+      state, district, mandal, village, pincode, addressLine,
+      eshramId, bocwId
+    ]);
+
+    res.json({ success: true, message: 'Worker registered successfully', workerId });
+
+  } catch (error) {
+    console.error('Worker Reg Error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 // REGISTER ESTABLISHMENT
 app.post('/api/register/establishment', async (req, res) => {
   const {
