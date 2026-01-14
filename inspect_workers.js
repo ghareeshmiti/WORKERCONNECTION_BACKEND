@@ -9,17 +9,12 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
-async function inspectMappings() {
+async function inspectWorkers() {
     const client = await pool.connect();
     try {
-        console.log('Inspecting active mappings...');
-        const result = await client.query('SELECT * FROM worker_mappings WHERE is_active = true');
+        console.log('Inspecting workers...');
+        const result = await client.query('SELECT worker_id, first_name, status, is_active, district FROM workers');
         console.log(JSON.stringify(result.rows, null, 2));
-
-        console.log('Inspecting all workers...');
-        const workers = await client.query('SELECT id, worker_id, status FROM workers');
-        console.log(JSON.stringify(workers.rows, null, 2));
-
     } catch (err) {
         console.error('Inspection failed:', err);
     } finally {
@@ -28,4 +23,4 @@ async function inspectMappings() {
     }
 }
 
-inspectMappings();
+inspectWorkers();
