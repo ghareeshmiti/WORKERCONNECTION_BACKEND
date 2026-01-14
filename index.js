@@ -179,7 +179,9 @@ async function upsertDailyRollup(workerId, establishmentId, eventType, timestamp
         // Ideally calculate based on sessions, but for now simple update
         await pool.query(`
            UPDATE attendance_daily_rollups 
-           SET last_checkout_at = $1, status = 'PRESENT'
+           SET last_checkout_at = $1, 
+               status = 'PRESENT',
+               total_hours = ROUND(CAST(EXTRACT(EPOCH FROM ($1::timestamp - first_checkin_at)) / 3600 AS numeric), 2)
            WHERE id = $2
          `, [timestamp, rollup.id]);
       } else if (eventType === 'CHECK_IN' && !rollup.first_checkin_at) {
