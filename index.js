@@ -800,6 +800,41 @@ app.get('/api/status/:username', async (req, res) => {
   res.json(status);
 });
 
+
+// REJECT WORKER
+app.put('/api/admin/workers/:id/reject', async (req, res) => {
+  const { id } = req.params;
+  const { reason } = req.body; // Expect a reason
+
+  if (!reason) {
+    return res.status(400).json({ success: false, message: 'Rejection reason is required' });
+  }
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE workers 
+           SET status = 'rejected', 
+               rejection_reason = $1, 
+               is_active = false, 
+               updated_at = NOW() 
+           WHERE worker_id = $2 RETURNING *`,
+      [reason, id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, message: 'Worker not found' });
+    }
+
+    res.json({ success: true, message: 'Worker rejected successfully', worker: result.rows[0] });
+  } catch (error) {
+    console.error('Reject Worker Error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 // STATIONS
 app.get('/api/admin/stations', async (req, res) => {
   try {
