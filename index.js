@@ -814,7 +814,7 @@ app.put('/api/admin/workers/:id/approve', async (req, res) => {
        SET status = 'active', 
            is_active = true, 
            updated_at = NOW() 
-       WHERE worker_id = $1 OR id = $1
+       WHERE ${/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) ? 'id = $1' : 'worker_id = $1'}
        RETURNING *`,
       [id]
     );
