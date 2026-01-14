@@ -153,6 +153,49 @@ async function getCheckStatus(username) {
   return res.rows[0] || { status: 'out', timestamp: null };
 }
 
+async function upsertDailyRollup(workerId, establishmentId, eventType, timestamp) {
+  const date = timestamp.split('T')[0]; // YYYY-MM-DD
+
+  try {
+    // Check if rollup exists
+    const res = await pool.query(
+      'SELECT * FROM attendance_daily_rollups WHERE worker_id = $1 AND attendance_date = $2',
+      [workerId, date]
+    );
+
+    let rollup = res.rows[0];
+
+    if (!rollup) {
+      // Create new rollup
+      await pool.query(`
+        INSERT INTO attendance_daily_rollups 
+        (worker_id, establishment_id, attendance_date, status, first_checkin_at, total_hours)
+        VALUES ($1, $2, $3, 'PRESENT', $4, 0)
+      `, [workerId, establishmentId, date, eventType === 'CHECK_IN' ? timestamp : null]);
+    } else {
+      // Update existing
+      if (eventType === 'CHECK_OUT') {
+        // Calculate duration roughly (last_checkout - first_checkin) or just update last_checkout
+        // Ideally calculate based on sessions, but for now simple update
+        await pool.query(`
+           UPDATE attendance_daily_rollups 
+           SET last_checkout_at = $1, status = 'PRESENT'
+           WHERE id = $2
+         `, [timestamp, rollup.id]);
+      } else if (eventType === 'CHECK_IN' && !rollup.first_checkin_at) {
+        // Backfill first checkin if missing
+        await pool.query(`
+           UPDATE attendance_daily_rollups 
+           SET first_checkin_at = $1
+           WHERE id = $2
+         `, [timestamp, rollup.id]);
+      }
+    }
+  } catch (e) {
+    console.error('Error syncing rollup:', e);
+  }
+}
+
 async function updateCheckStatus(username, status, location = 'Unknown') {
   const timestamp = new Date().toISOString();
 
@@ -185,6 +228,11 @@ async function updateCheckStatus(username, status, location = 'Unknown') {
     (worker_id, event_type, establishment_id, occurred_at, region)
     VALUES ($1, $2, $3, $4, $5)
   `, [worker.id, eventType, establishmentId, timestamp, location]);
+
+  // 5. Sync Rollup (Dashboard View)
+  if (establishmentId) {
+    if (upsertDailyRollup) await upsertDailyRollup(worker.id, establishmentId, eventType, timestamp);
+  }
 
   // Legacy support cleanup (optional, keeping valid for now)
   /*
