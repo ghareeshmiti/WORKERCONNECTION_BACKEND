@@ -598,7 +598,7 @@ app.post('/api/register/establishment', async (req, res) => {
         $7, $8, $9, $10, $11, $12, $13,
         $14, $15, $16, $17,
         $18, $19, $20,
-        true, NOW(), NOW()
+        false, NOW(), NOW()
       )
     `, [
       userId, departmentId, name, code, description, establishmentType,
