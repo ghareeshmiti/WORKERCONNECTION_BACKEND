@@ -956,16 +956,30 @@ app.post('/api/auth/worker-login', async (req, res) => {
         email,
         password,
         email_confirm: true,
-        user_metadata: { role: 'worker', worker_id: worker.worker_id, aadhaar_last_four: aadhaar.slice(-4) }
+        user_metadata: {
+          role: 'worker',
+          worker_id: worker.worker_id, // String ID (WKR...)
+          worker_uuid: worker.id,      // UUID
+          aadhaar_last_four: aadhaar.slice(-4)
+        }
       });
 
       if (createError) {
         if (createError.message?.includes('already registered')) {
-          // Update password to ensure it matches
+          // Update password AND metadata to ensure it matches
           const { data: userList } = await supabaseAdmin.auth.admin.listUsers();
           const existing = userList.users.find(u => u.email === email);
           if (existing) {
-            await supabaseAdmin.auth.admin.updateUserById(existing.id, { password });
+            await supabaseAdmin.auth.admin.updateUserById(existing.id, {
+              password,
+              user_metadata: {
+                ...existing.user_metadata,
+                role: 'worker',
+                worker_id: worker.worker_id,
+                worker_uuid: worker.id,
+                aadhaar_last_four: aadhaar.slice(-4)
+              }
+            });
           }
           // Retry login
           const retry = await supabaseAdmin.auth.signInWithPassword({ email, password });
