@@ -909,7 +909,7 @@ app.post('/api/auth/worker-otp', async (req, res) => {
   if (!aadhaar) return res.status(400).json({ error: "Aadhaar required" });
 
   try {
-    const { rows } = await pool.query('SELECT id FROM workers WHERE aadhaar_number = $1', [aadhaar]);
+    const { rows } = await pool.query("SELECT id FROM workers WHERE REPLACE(aadhaar_number, '-', '') = $1", [aadhaar]);
     if (rows.length === 0) {
       return res.status(404).json({ error: "No worker found with this Aadhaar number" });
     }
@@ -930,7 +930,7 @@ app.post('/api/auth/worker-login', async (req, res) => {
   }
 
   try {
-    const { rows } = await pool.query('SELECT * FROM workers WHERE aadhaar_number = $1', [aadhaar]);
+    const { rows } = await pool.query("SELECT * FROM workers WHERE REPLACE(aadhaar_number, '-', '') = $1", [aadhaar]);
     if (rows.length === 0) {
       return res.status(404).json({ error: "Worker not found" });
     }
