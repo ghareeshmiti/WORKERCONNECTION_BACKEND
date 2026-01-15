@@ -754,6 +754,7 @@ app.post('/api/admin/approve-establishment', async (req, res) => {
       UPDATE establishments 
       SET 
         is_approved = true,
+        is_active = true,
         card_reader_id = $1,
         approved_by = $2,
         approved_at = NOW(),
