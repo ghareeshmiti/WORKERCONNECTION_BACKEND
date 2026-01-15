@@ -902,6 +902,96 @@ app.delete('/api/admin/stations/:name', async (req, res) => {
   }
 });
 
+// --- Worker Aadhaar Auth ---
+
+app.post('/api/auth/worker-otp', async (req, res) => {
+  const { aadhaar } = req.body;
+  if (!aadhaar) return res.status(400).json({ error: "Aadhaar required" });
+
+  try {
+    const { rows } = await pool.query('SELECT id FROM workers WHERE aadhaar_number = $1', [aadhaar]);
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "No worker found with this Aadhaar number" });
+    }
+    // Mock OTP (In prod, send SMS)
+    console.log(`[OTP] Sent to worker ${rows[0].id}`);
+    res.json({ success: true, message: "OTP sent successfully" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post('/api/auth/worker-login', async (req, res) => {
+  const { aadhaar, otp } = req.body;
+
+  if (!otp || otp.length !== 6) {
+    return res.status(400).json({ error: "Invalid OTP" });
+  }
+
+  try {
+    const { rows } = await pool.query('SELECT * FROM workers WHERE aadhaar_number = $1', [aadhaar]);
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Worker not found" });
+    }
+    const worker = rows[0];
+
+    if (!supabaseAdmin) {
+      return res.status(500).json({ error: "Supabase Admin not configured" });
+    }
+
+    // Shadow User Strategy
+    const email = `${worker.worker_id}@worker.miti.app`.toLowerCase();
+    const password = `WkrLogin#${worker.worker_id}#${process.env.SUPABASE_SERVICE_ROLE_KEY ? process.env.SUPABASE_SERVICE_ROLE_KEY.slice(0, 5) : 'dev'}`;
+
+    // Attempt Sign In
+    let { data, error } = await supabaseAdmin.auth.signInWithPassword({
+      email,
+      password
+    });
+
+    // If failed, check if user needs creation
+    if (error) {
+      const { data: newUser, error: createError } = await supabaseAdmin.auth.admin.createUser({
+        email,
+        password,
+        email_confirm: true,
+        user_metadata: { role: 'worker', worker_id: worker.worker_id, aadhaar_last_four: aadhaar.slice(-4) }
+      });
+
+      if (createError) {
+        if (createError.message?.includes('already registered')) {
+          // Update password to ensure it matches
+          const { data: userList } = await supabaseAdmin.auth.admin.listUsers();
+          const existing = userList.users.find(u => u.email === email);
+          if (existing) {
+            await supabaseAdmin.auth.admin.updateUserById(existing.id, { password });
+          }
+          // Retry login
+          const retry = await supabaseAdmin.auth.signInWithPassword({ email, password });
+          data = retry.data;
+          error = retry.error;
+        } else {
+          throw createError;
+        }
+      } else {
+        // User created, now login
+        const retry = await supabaseAdmin.auth.signInWithPassword({ email, password });
+        data = retry.data;
+        error = retry.error;
+      }
+    }
+
+    if (error) throw error;
+
+    res.json({ session: data.session, user: data.user });
+
+  } catch (err) {
+    console.error('Worker Login Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // HTTPS Setup (Conditional for Local Dev - Vercel handles HTTPS automatically)
 let httpsOptions = {};
 try {
