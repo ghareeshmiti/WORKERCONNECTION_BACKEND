@@ -607,7 +607,10 @@ app.post('/api/public/register-worker', async (req, res) => {
   const {
     firstName, lastName, gender, dob, phone, aadhaarNumber,
     state, district, mandal, village, pincode, addressLine,
-    eshramId, bocwId
+    eshramId, bocwId,
+    fatherName, motherName, bankAccountNumber, ifscCode,
+    maritalStatus, caste, disabilityStatus, nresMember, tradeUnionMember,
+    educationLevel, skillCategory, workHistory, photoUrl
   } = req.body;
 
   if (!firstName || !lastName || !phone || !aadhaarNumber || !district || !mandal) {
@@ -616,21 +619,12 @@ app.post('/api/public/register-worker', async (req, res) => {
 
   const client = await pool.connect();
   try {
-    // 1. Generate Worker ID
-    const { rows: countRows } = await client.query('SELECT count(*) FROM workers');
-    const count = parseInt(countRows[0].count, 10);
-    const workerId = `WKR${String(count + 1).padStart(8, '0')}`;
+    // 1. Generate Worker ID (Format: WKR + Timestamp(6) + Random(4))
+    const timestamp = Date.now().toString().slice(-6);
+    const random = Math.floor(1000 + Math.random() * 9000).toString();
+    const workerId = `WKR${timestamp}${random}`;
 
     // 2. Insert into workers table
-    // Note: mapping to a department/establishment happens later via admin approval or separately.
-    // We set status='new' so it shows up in "Pending Approvals" for Department Admins.
-    // We need to infer department_id from location if possible, or leave null for now.
-    // For now, we will leave department_id NULL or try to match based on District.
-
-    // Let's try to find a department in this district to assign tentatively? 
-    // Or just insert with NO department and filter by district in the dashboard.
-    // The dashboard query filters by District, so we just need to ensure District is saved.
-
     const aadhaarLastFour = aadhaarNumber.slice(-4);
 
     await client.query(`
@@ -639,13 +633,28 @@ app.post('/api/public/register-worker', async (req, res) => {
               aadhaar_number, aadhaar_last_four,
               state, district, mandal, village, pincode, address_line,
               eshram_id, bocw_id,
+              father_name, mother_name, bank_account_number, ifsc_code,
+              marital_status, caste, disability_status, nres_member, trade_union_member,
+              education_level, skill_category, work_history, photo_url,
               status, is_active, created_at, updated_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'new', true, NOW(), NOW())
+          ) VALUES (
+              $1, $2, $3, $4, $5, $6,
+              $7, $8,
+              $9, $10, $11, $12, $13, $14,
+              $15, $16,
+              $17, $18, $19, $20,
+              $21, $22, $23, $24, $25,
+              $26, $27, $28, $29,
+              'new', true, NOW(), NOW()
+          )
       `, [
       workerId, firstName, lastName, gender, dob, phone,
       aadhaarNumber, aadhaarLastFour,
       state, district, mandal, village, pincode, addressLine,
-      eshramId, bocwId
+      eshramId, bocwId,
+      fatherName, motherName, bankAccountNumber, ifscCode,
+      maritalStatus, caste, disabilityStatus, nresMember, tradeUnionMember,
+      educationLevel, skillCategory, workHistory, photoUrl
     ]);
 
     res.json({ success: true, message: 'Worker registered successfully', workerId });
