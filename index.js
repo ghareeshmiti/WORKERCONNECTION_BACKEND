@@ -379,6 +379,10 @@ app.post('/api/login/begin', async (req, res) => {
   if (username) {
     user = await getOrCreateUser(username);
     const authenticators = await getUserAuthenticators(username);
+
+    // Check removed per user request for simplfied flow
+
+
     allowCredentials = authenticators.map(dev => ({
       id: isoBase64URL.fromBuffer(dev.credentialID),
       type: 'public-key',
