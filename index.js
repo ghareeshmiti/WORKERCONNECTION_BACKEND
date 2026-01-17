@@ -468,15 +468,74 @@ app.post('/api/login/finish', async (req, res) => {
 
       let status = 'out';
       let message = 'Authenticated';
+      let session = null;
+      let supabaseUser = null;
 
       if (action === 'toggle') {
         const check = await getCheckStatus(user.username);
         status = check.status === 'out' ? 'in' : 'out';
         await updateCheckStatus(user.username, status, location);
         message = status === 'in' ? `Welcome back ${user.username}! Checked In.` : `Goodbye ${user.username}! Checked Out.`;
+      } else {
+        // LOGIN ACTION: Generate Supabase Session if it's a worker
+        try {
+          // Check if this username belongs to a worker
+          const wRes = await pool.query("SELECT * FROM workers WHERE worker_id = $1", [user.username]);
+          if (wRes.rows.length > 0 && supabaseAdmin) {
+            const worker = wRes.rows[0];
+            const email = `${worker.worker_id}@worker.miti.app`.toLowerCase();
+            // Use same deterministic password logic as worker-login
+            const password = `WkrLogin#${worker.worker_id}#${process.env.SUPABASE_SERVICE_ROLE_KEY ? process.env.SUPABASE_SERVICE_ROLE_KEY.slice(0, 5) : 'dev'}`;
+
+            let { data, error } = await supabaseAdmin.auth.signInWithPassword({ email, password });
+
+            if (error) {
+              // If login fails (maybe first time FIDO user but shadow user not forced yet?), try create/update
+              // This mimics the robust logic in /api/auth/worker-login
+              const { data: newUser, error: createError } = await supabaseAdmin.auth.admin.createUser({
+                email,
+                password,
+                email_confirm: true,
+                user_metadata: {
+                  role: 'worker',
+                  worker_id: worker.worker_id,
+                  worker_uuid: worker.id,
+                  aadhaar_last_four: worker.aadhaar_number ? worker.aadhaar_number.slice(-4) : '0000'
+                }
+              });
+
+              if (createError) {
+                if (createError.message?.includes('already registered')) {
+                  // Update to ensure password match
+                  const { data: userList } = await supabaseAdmin.auth.admin.listUsers();
+                  const existing = userList.users.find(u => u.email === email);
+                  if (existing) {
+                    await supabaseAdmin.auth.admin.updateUserById(existing.id, { password });
+                  }
+                  const retry = await supabaseAdmin.auth.signInWithPassword({ email, password });
+                  data = retry.data;
+                  error = retry.error;
+                }
+              } else {
+                // Created new
+                const retry = await supabaseAdmin.auth.signInWithPassword({ email, password });
+                data = retry.data;
+                error = retry.error;
+              }
+            }
+
+            if (!error && data) {
+              session = data.session;
+              supabaseUser = data.user;
+            }
+          }
+        } catch (sessErr) {
+          console.error('Failed to generate session for FIDO user:', sessErr);
+          // Don't block FIDO success, but client might fail to redirect
+        }
       }
 
-      res.json({ verified: true, status, message, username: user.username });
+      res.json({ verified: true, status, message, username: user.username, session, user: supabaseUser });
     } else {
       res.status(400).json({ verified: false });
     }
