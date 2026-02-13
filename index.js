@@ -1079,6 +1079,84 @@ app.post('/api/auth/worker-login', async (req, res) => {
   }
 });
 
+//--- nfc ---
+app.post('/api/auth/nfc-login', async (req, res) => {
+  const { cardId, apduHex, uidHex } = req.body;
+ 
+  // Choose a single identifier. For POC, use cardId.
+  const lookup = cardId || uidHex || apduHex;
+  if (!lookup) return res.status(400).json({ error: "cardId/uidHex/apduHex required" });
+ 
+  try {
+    // IMPORTANT:
+    // Decide how card maps to worker.
+    // POC option: worker.worker_id == cardId (or store UID in a column)
+    const { rows } = await pool.query(
+      `SELECT * FROM workers WHERE worker_id = $1 LIMIT 1`,
+      [lookup]
+    );
+ 
+    if (rows.length === 0) return res.status(404).json({ error: "Worker not found for this card" });
+    const worker = rows[0];
+ 
+    if (!supabaseAdmin) return res.status(500).json({ error: "Supabase Admin not configured" });
+ 
+    // Shadow User Strategy (same as worker-login)
+    const email = `${worker.worker_id}@worker.miti.app`.toLowerCase();
+    const password = `WkrLogin#${worker.worker_id}#${process.env.SUPABASE_SERVICE_ROLE_KEY ? process.env.SUPABASE_SERVICE_ROLE_KEY.slice(0, 5) : 'dev'}`;
+ 
+    let { data, error } = await supabaseAdmin.auth.signInWithPassword({ email, password });
+ 
+    if (error) {
+      const { data: newUser, error: createError } = await supabaseAdmin.auth.admin.createUser({
+        email,
+        password,
+        email_confirm: true,
+        user_metadata: {
+          role: 'worker',
+          worker_id: worker.worker_id,
+          worker_uuid: worker.id,
+        }
+      });
+ 
+      if (createError) {
+        if (createError.message?.includes('already registered')) {
+          const { data: userList } = await supabaseAdmin.auth.admin.listUsers();
+          const existing = userList.users.find(u => u.email === email);
+          if (existing) {
+            await supabaseAdmin.auth.admin.updateUserById(existing.id, {
+              password,
+              user_metadata: {
+                ...existing.user_metadata,
+                role: 'worker',
+                worker_id: worker.worker_id,
+                worker_uuid: worker.id,
+              }
+            });
+          }
+          const retry = await supabaseAdmin.auth.signInWithPassword({ email, password });
+          data = retry.data;
+          error = retry.error;
+        } else {
+          throw createError;
+        }
+      } else {
+        const retry = await supabaseAdmin.auth.signInWithPassword({ email, password });
+        data = retry.data;
+        error = retry.error;
+      }
+    }
+ 
+    if (error) throw error;
+ 
+    return res.json({ session: data.session, user: data.user });
+ 
+  } catch (err) {
+    console.error('NFC Login Error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+// ---- nfc end---
 // HTTPS Setup (Conditional for Local Dev - Vercel handles HTTPS automatically)
 let httpsOptions = {};
 try {
