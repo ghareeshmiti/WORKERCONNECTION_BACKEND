@@ -54,7 +54,13 @@ const getRpConfig = (req) => {
     }
   }
 
-  return { rpID, origin: origin || `http://${rpID}:5173` };
+  // For mobile app requests (no origin header), use the known rpID
+  // The FIDO2 credentials are registered under workerconnect.miti.us
+  if (!origin) {
+    rpID = 'workerconnect.miti.us';
+  }
+
+  return { rpID, origin: origin || `https://workerconnect.miti.us` };
 };
 
 // --- HELPER ISOBUE ---
@@ -316,10 +322,20 @@ app.post('/api/register/finish', async (req, res) => {
 
   try {
     const { rpID, origin } = getRpConfig(req);
+
+    // Accept Android app origins for mobile registration
+    let expectedOrigins = [origin, `https://${rpID}`];
+    try {
+      const clientData = JSON.parse(Buffer.from(body.response.clientDataJSON, 'base64url').toString('utf8'));
+      if (clientData.origin && clientData.origin.startsWith('android:')) {
+        expectedOrigins.push(clientData.origin);
+      }
+    } catch (e) { /* ignore */ }
+
     const verification = await verifyRegistrationResponse({
       response: body,
       expectedChallenge: user.currentChallenge,
-      expectedOrigin: origin,
+      expectedOrigin: expectedOrigins,
       expectedRPID: rpID,
     });
 
@@ -447,10 +463,25 @@ app.post('/api/login/finish', async (req, res) => {
     if (!dbAuthenticator) throw new Error('Authenticator not found');
 
     const { rpID, origin } = getRpConfig(req);
+
+    // For mobile apps (Android), the origin in clientDataJSON may be
+    // "android:apk-key-hash:<SHA256>" instead of a web URL.
+    // Extract actual origin from clientDataJSON to handle this.
+    let expectedOrigins = [origin, `https://${rpID}`];
+    try {
+      const clientData = JSON.parse(Buffer.from(body.response.clientDataJSON, 'base64url').toString('utf8'));
+      if (clientData.origin && !expectedOrigins.includes(clientData.origin)) {
+        // Accept Android app origins (android:apk-key-hash:...)
+        if (clientData.origin.startsWith('android:')) {
+          expectedOrigins.push(clientData.origin);
+        }
+      }
+    } catch (e) { /* ignore parse errors, let verification handle it */ }
+
     const verification = await verifyAuthenticationResponse({
       response: body,
       expectedChallenge: currentChallenge,
-      expectedOrigin: origin,
+      expectedOrigin: expectedOrigins,
       expectedRPID: rpID,
       credential: {
         id: dbAuthenticator.credentialID,
