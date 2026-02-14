@@ -1080,23 +1080,83 @@ app.post('/api/auth/worker-login', async (req, res) => {
 });
 
 //--- nfc ---
-app.post('/api/auth/nfc-login', async (req, res) => {
-  const { cardId, apduHex, uidHex } = req.body;
- 
-  // Choose a single identifier. For POC, use cardId.
-  const lookup = cardId || uidHex || apduHex;
-  if (!lookup) return res.status(400).json({ error: "cardId/uidHex/apduHex required" });
- 
+
+// Register/assign a card UID to a worker
+app.post('/api/admin/workers/register-card', async (req, res) => {
+  const { worker_id, card_uid } = req.body;
+
+  if (!worker_id || !card_uid) {
+    return res.status(400).json({ error: 'worker_id and card_uid are required' });
+  }
+
+  const normalizedUid = card_uid.toUpperCase().trim();
+
   try {
-    // IMPORTANT:
-    // Decide how card maps to worker.
-    // POC option: worker.worker_id == cardId (or store UID in a column)
+    // Check if this card is already assigned to another worker
+    const existing = await pool.query(
+      `SELECT worker_id, first_name, last_name FROM workers WHERE UPPER(card_uid) = $1`,
+      [normalizedUid]
+    );
+
+    if (existing.rows.length > 0 && existing.rows[0].worker_id !== worker_id) {
+      return res.status(409).json({
+        error: `This card is already assigned to worker ${existing.rows[0].worker_id} (${existing.rows[0].first_name} ${existing.rows[0].last_name})`
+      });
+    }
+
+    // Assign card to the worker
+    const result = await pool.query(
+      `UPDATE workers SET card_uid = $1, updated_at = NOW() WHERE worker_id = $2 RETURNING *`,
+      [normalizedUid, worker_id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Worker not found' });
+    }
+
+    res.json({ success: true, message: `Card ${normalizedUid} registered to worker ${worker_id}`, worker: result.rows[0] });
+  } catch (err) {
+    console.error('Register Card Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Unlink a card from a worker
+app.delete('/api/admin/workers/:worker_id/card', async (req, res) => {
+  const { worker_id } = req.params;
+
+  try {
+    const result = await pool.query(
+      `UPDATE workers SET card_uid = NULL, updated_at = NOW() WHERE worker_id = $1 RETURNING *`,
+      [worker_id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Worker not found' });
+    }
+
+    res.json({ success: true, message: `Card unlinked from worker ${worker_id}` });
+  } catch (err) {
+    console.error('Unlink Card Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/auth/nfc-login', async (req, res) => {
+  const { cardId, uidHex } = req.body;
+
+  // Use card UID (hex) as the primary identifier
+  const lookup = (cardId || uidHex || '').toUpperCase().trim();
+  if (!lookup) return res.status(400).json({ error: "cardId/uidHex required" });
+
+  try {
+    // Look up worker by card_uid column
     const { rows } = await pool.query(
-      `SELECT * FROM workers WHERE worker_id = $1 LIMIT 1`,
+      `SELECT * FROM workers WHERE UPPER(card_uid) = $1 LIMIT 1`,
       [lookup]
     );
- 
-    if (rows.length === 0) return res.status(404).json({ error: "Worker not found for this card" });
+
+    if (rows.length === 0) return res.status(404).json({ error: "No worker registered for this card. Please register your card first." });
     const worker = rows[0];
  
     if (!supabaseAdmin) return res.status(500).json({ error: "Supabase Admin not configured" });
