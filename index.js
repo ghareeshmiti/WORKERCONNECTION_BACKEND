@@ -388,9 +388,20 @@ app.post('/api/register/finish', async (req, res) => {
 
 // AUTHENTICATION
 app.post('/api/login/begin', async (req, res) => {
-  const { username } = req.body;
+  let { username } = req.body;
   let allowCredentials = [];
   let user;
+
+  // If username is a 12-digit Aadhaar number, resolve to worker_id
+  if (username && /^\d{12}$/.test(username)) {
+    const workerRes = await pool.query('SELECT worker_id FROM workers WHERE aadhaar_number = $1', [username]);
+    if (workerRes.rowCount > 0) {
+      username = workerRes.rows[0].worker_id;
+      console.log(`Resolved Aadhaar to worker_id: ${username}`);
+    } else {
+      return res.status(404).json({ error: 'No worker found with this Aadhaar number' });
+    }
+  }
 
   if (username) {
     user = await getOrCreateUser(username);
@@ -425,11 +436,19 @@ app.post('/api/login/begin', async (req, res) => {
 const pendingChallenges = new Map();
 
 app.post('/api/login/finish', async (req, res) => {
-  const { username, body, action, location } = req.body;
+  let { username, body, action, location } = req.body;
   let user;
   let currentChallenge;
 
   try {
+    // If username is a 12-digit Aadhaar number, resolve to worker_id
+    if (username && /^\d{12}$/.test(username)) {
+      const workerRes = await pool.query('SELECT worker_id FROM workers WHERE aadhaar_number = $1', [username]);
+      if (workerRes.rowCount > 0) {
+        username = workerRes.rows[0].worker_id;
+      }
+    }
+
     if (username) {
       user = await getOrCreateUser(username);
       currentChallenge = user.currentChallenge;
