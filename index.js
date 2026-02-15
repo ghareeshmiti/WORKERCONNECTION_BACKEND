@@ -415,6 +415,20 @@ app.post('/api/login/begin', async (req, res) => {
       type: 'public-key',
       transports: dev.transports,
     }));
+  } else {
+    // Usernameless flow: return ALL registered credentials so Android Credential
+    // Manager can match against NFC security keys. Browsers handle empty
+    // allowCredentials natively, but Android needs explicit credential IDs
+    // to prompt for NFC security key. The user is identified after auth
+    // via the credential used + userHandle.
+    const allAuthRes = await pool.query('SELECT "credentialID", transports FROM authenticators');
+    if (allAuthRes.rowCount > 0) {
+      allowCredentials = allAuthRes.rows.map(row => ({
+        id: isoBase64URL.fromBuffer(row.credentialID),
+        type: 'public-key',
+        transports: JSON.parse(row.transports || '[]'),
+      }));
+    }
   }
 
   const { rpID } = getRpConfig(req);
