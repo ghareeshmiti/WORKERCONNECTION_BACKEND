@@ -1308,10 +1308,10 @@ app.get('/api/health/worker-lookup', async (req, res) => {
   try {
     let query, params;
     if (card_uid) {
-      query = `SELECT id, worker_id, first_name, last_name, aadhaar_number, gender, dob, district, mandal, mobile_number, profile_photo_url, blood_group, allergies, chronic_conditions, scheme_name FROM workers WHERE card_uid = $1 LIMIT 1`;
+      query = `SELECT id, worker_id, first_name, last_name, aadhaar_number, gender, dob, district, mandal, phone, photo_url, blood_group, allergies, chronic_conditions, scheme_name FROM workers WHERE card_uid = $1 LIMIT 1`;
       params = [card_uid];
     } else if (worker_id) {
-      query = `SELECT id, worker_id, first_name, last_name, aadhaar_number, gender, dob, district, mandal, mobile_number, profile_photo_url, blood_group, allergies, chronic_conditions, scheme_name FROM workers WHERE worker_id = $1 LIMIT 1`;
+      query = `SELECT id, worker_id, first_name, last_name, aadhaar_number, gender, dob, district, mandal, phone, photo_url, blood_group, allergies, chronic_conditions, scheme_name FROM workers WHERE worker_id = $1 LIMIT 1`;
       params = [worker_id];
     } else {
       return res.status(400).json({ error: 'worker_id or card_uid required' });
