@@ -37,7 +37,7 @@ const pool = new Pool({
 const supabaseUrl = process.env.SUPABASE_URL || 'https://seecqtxhpsostjniabeo.supabase.co';
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const supabaseAdmin = supabaseServiceKey ? createClient(supabaseUrl, supabaseServiceKey) : null;
-
+  
 // Global settings
 const rpName = 'FIDO Check-in System';
 
