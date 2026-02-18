@@ -1222,15 +1222,15 @@ app.post('/api/auth/nfc-login', async (req, res) => {
 
     if (rows.length === 0) return res.status(404).json({ error: "No worker registered for this card. Please register your card first." });
     const worker = rows[0];
- 
+
     if (!supabaseAdmin) return res.status(500).json({ error: "Supabase Admin not configured" });
- 
+
     // Shadow User Strategy (same as worker-login)
     const email = `${worker.worker_id}@worker.miti.app`.toLowerCase();
     const password = `WkrLogin#${worker.worker_id}#${process.env.SUPABASE_SERVICE_ROLE_KEY ? process.env.SUPABASE_SERVICE_ROLE_KEY.slice(0, 5) : 'dev'}`;
- 
+
     let { data, error } = await supabaseAdmin.auth.signInWithPassword({ email, password });
- 
+
     if (error) {
       const { data: newUser, error: createError } = await supabaseAdmin.auth.admin.createUser({
         email,
@@ -1242,7 +1242,7 @@ app.post('/api/auth/nfc-login', async (req, res) => {
           worker_uuid: worker.id,
         }
       });
- 
+
       if (createError) {
         if (createError.message?.includes('already registered')) {
           const { data: userList } = await supabaseAdmin.auth.admin.listUsers();
@@ -1270,17 +1270,43 @@ app.post('/api/auth/nfc-login', async (req, res) => {
         error = retry.error;
       }
     }
- 
+
     if (error) throw error;
- 
+
     return res.json({ session: data.session, user: data.user });
- 
+
   } catch (err) {
     console.error('NFC Login Error:', err);
     return res.status(500).json({ error: err.message });
   }
 });
 // ---- nfc end---
+
+// --- CONDUCTOR TICKETS ---
+app.post('/api/conductor/tickets', async (req, res) => {
+  const {
+    ticketId, passengerName, source, destination, fare, issuedBy, paymentMode, busNumber,
+    // New Fields
+    workerId, establishmentId, routeId, routeName, fromStop, toStop, isFree, govtSubsidyAmount, conductorId, remarks
+  } = req.body;
+
+  try {
+    await pool.query(
+      `INSERT INTO tickets (
+        ticket_id, passenger_name, source, destination, fare, issued_by, payment_mode, bus_number,
+        worker_id, establishment_id, route_id, route_name, from_stop, to_stop, is_free, govt_subsidy_amount, conductor_id, remarks
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
+      [
+        ticketId, passengerName, source, destination, fare, issuedBy, paymentMode, busNumber,
+        workerId || null, establishmentId || null, routeId, routeName, fromStop, toStop, isFree || false, govtSubsidyAmount || 0, conductorId || null, remarks
+      ]
+    );
+    res.json({ success: true, message: 'Ticket saved' });
+  } catch (e) {
+    console.error('Error saving ticket:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
 // HTTPS Setup (Conditional for Local Dev - Vercel handles HTTPS automatically)
 let httpsOptions = {};
 try {
