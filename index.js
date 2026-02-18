@@ -1271,9 +1271,27 @@ app.post('/api/auth/nfc-login', async (req, res) => {
       }
     }
 
+    if (action === 'toggle') {
+      // Toggle attendance status
+      const check = await getCheckStatus(worker.worker_id);
+      const newStatus = check.status === 'out' ? 'in' : 'out';
+      await updateCheckStatus(worker.worker_id, newStatus, location);
+      const message = newStatus === 'in' ? `Welcome back ${worker.first_name}! Checked In.` : `Goodbye ${worker.first_name}! Checked Out.`;
+
+      return res.json({
+        success: true,
+        verified: true,
+        message,
+        status: newStatus,
+        worker,
+        username: worker.worker_id
+      });
+    }
+
+    // Default LOGIN action
     if (error) throw error;
 
-    return res.json({ session: data.session, user: data.user });
+    return res.json({ session: data.session, user: data.user, worker });
 
   } catch (err) {
     console.error('NFC Login Error:', err);
@@ -1281,6 +1299,163 @@ app.post('/api/auth/nfc-login', async (req, res) => {
   }
 });
 // ---- nfc end---
+
+// ==================== HEALTH API ====================
+
+// GET /api/health/worker-lookup?worker_id=WKR... or ?card_uid=...
+app.get('/api/health/worker-lookup', async (req, res) => {
+  const { worker_id, card_uid } = req.query;
+  try {
+    let query, params;
+    if (card_uid) {
+      query = `SELECT id, worker_id, first_name, last_name, aadhaar_number, gender, dob, district, mandal, mobile_number, profile_photo_url, blood_group, allergies, chronic_conditions, scheme_name FROM workers WHERE card_uid = $1 LIMIT 1`;
+      params = [card_uid];
+    } else if (worker_id) {
+      query = `SELECT id, worker_id, first_name, last_name, aadhaar_number, gender, dob, district, mandal, mobile_number, profile_photo_url, blood_group, allergies, chronic_conditions, scheme_name FROM workers WHERE worker_id = $1 LIMIT 1`;
+      params = [worker_id];
+    } else {
+      return res.status(400).json({ error: 'worker_id or card_uid required' });
+    }
+    const result = await pool.query(query, params);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Worker not found' });
+    const worker = result.rows[0];
+    // Fetch recent records
+    const records = await pool.query(`SELECT * FROM hospital_records WHERE worker_id = $1 ORDER BY created_at DESC LIMIT 10`, [worker.id]);
+    const appointments = await pool.query(`SELECT * FROM health_appointments WHERE worker_id = $1 ORDER BY appointment_date ASC`, [worker.id]);
+    const checkups = await pool.query(`SELECT * FROM health_checkups WHERE worker_id = $1 ORDER BY checkup_date DESC LIMIT 5`, [worker.id]);
+    res.json({ worker, records: records.rows, appointments: appointments.rows, checkups: checkups.rows });
+  } catch (err) {
+    console.error('Health worker lookup error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/health/record - Add a new health record
+app.post('/api/health/record', async (req, res) => {
+  const { worker_id, establishment_id, operator_id, service_type, scheme_name, diagnosis, description, cost, govt_paid } = req.body;
+  try {
+    const result = await pool.query(`
+      INSERT INTO hospital_records (worker_id, establishment_id, operator_id, service_type, scheme_name, diagnosis, description, cost, govt_paid)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *
+    `, [worker_id, establishment_id, operator_id, service_type, scheme_name || 'Paid', diagnosis, description, cost || 0, govt_paid || 0]);
+    res.json({ success: true, record: result.rows[0] });
+  } catch (err) {
+    console.error('Add health record error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/health/records - Get records for a hospital or all (dept)
+app.get('/api/health/records', async (req, res) => {
+  const { establishment_id, worker_id, service_type, scheme_name, diagnosis, from_date, to_date, limit = 100 } = req.query;
+  try {
+    let conditions = [];
+    let params = [];
+    let idx = 1;
+    if (establishment_id) { conditions.push(`hr.establishment_id = $${idx++}`); params.push(establishment_id); }
+    if (worker_id) { conditions.push(`hr.worker_id = $${idx++}`); params.push(worker_id); }
+    if (service_type) { conditions.push(`hr.service_type = $${idx++}`); params.push(service_type); }
+    if (scheme_name) { conditions.push(`hr.scheme_name = $${idx++}`); params.push(scheme_name); }
+    if (diagnosis) { conditions.push(`hr.diagnosis ILIKE $${idx++}`); params.push(`%${diagnosis}%`); }
+    if (from_date) { conditions.push(`hr.created_at >= $${idx++}`); params.push(from_date); }
+    if (to_date) { conditions.push(`hr.created_at <= $${idx++}`); params.push(to_date); }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    params.push(parseInt(limit));
+    const result = await pool.query(`
+      SELECT hr.*, w.first_name, w.last_name, w.worker_id as worker_code, e.name as hospital_name
+      FROM hospital_records hr
+      LEFT JOIN workers w ON hr.worker_id = w.id
+      LEFT JOIN establishments e ON hr.establishment_id = e.id
+      ${where}
+      ORDER BY hr.created_at DESC
+      LIMIT $${idx}
+    `, params);
+    res.json({ records: result.rows });
+  } catch (err) {
+    console.error('Fetch health records error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/health/stats - Aggregated stats for dashboards
+app.get('/api/health/stats', async (req, res) => {
+  const { establishment_id, department_code = 'APHEALTH' } = req.query;
+  try {
+    let estFilter = establishment_id ? `AND hr.establishment_id = '${establishment_id}'` : '';
+
+    // Get dept establishments (hospitals)
+    const hospitals = await pool.query(`
+      SELECT e.id, e.name, e.district, e.code,
+        COUNT(hr.id) as records,
+        COALESCE(SUM(hr.cost), 0) as total_cost,
+        COALESCE(SUM(hr.govt_paid), 0) as govt_paid,
+        COALESCE(SUM(hr.cost - hr.govt_paid), 0) as patient_paid
+      FROM establishments e
+      LEFT JOIN hospital_records hr ON hr.establishment_id = e.id
+      WHERE e.establishment_type = 'Hospital'
+      ${establishment_id ? `AND e.id = '${establishment_id}'` : ''}
+      GROUP BY e.id, e.name, e.district, e.code
+      ORDER BY records DESC
+    `);
+
+    // By scheme
+    const byScheme = await pool.query(`
+      SELECT scheme_name, COUNT(*) as records, SUM(cost) as total_cost, SUM(govt_paid) as govt_paid
+      FROM hospital_records hr WHERE 1=1 ${estFilter}
+      GROUP BY scheme_name ORDER BY records DESC
+    `);
+
+    // By service
+    const byService = await pool.query(`
+      SELECT service_type, COUNT(*) as records, SUM(cost) as total_cost
+      FROM hospital_records hr WHERE 1=1 ${estFilter}
+      GROUP BY service_type ORDER BY records DESC
+    `);
+
+    // By disease
+    const byDisease = await pool.query(`
+      SELECT diagnosis, COUNT(*) as records, SUM(cost) as total_cost, SUM(govt_paid) as govt_paid
+      FROM hospital_records hr WHERE 1=1 ${estFilter} AND diagnosis IS NOT NULL
+      GROUP BY diagnosis ORDER BY records DESC LIMIT 15
+    `);
+
+    // By district (drill-down)
+    const byDistrict = await pool.query(`
+      SELECT e.district, COUNT(hr.id) as records, SUM(hr.cost) as total_cost, SUM(hr.govt_paid) as govt_paid
+      FROM hospital_records hr
+      JOIN establishments e ON hr.establishment_id = e.id
+      WHERE e.establishment_type = 'Hospital'
+      ${establishment_id ? `AND e.id = '${establishment_id}'` : ''}
+      GROUP BY e.district ORDER BY records DESC
+    `);
+
+    // Totals
+    const totals = await pool.query(`
+      SELECT COUNT(DISTINCT hr.worker_id) as unique_patients,
+        COUNT(hr.id) as total_records,
+        COALESCE(SUM(hr.cost), 0) as total_cost,
+        COALESCE(SUM(hr.govt_paid), 0) as govt_paid
+      FROM hospital_records hr
+      LEFT JOIN establishments e ON hr.establishment_id = e.id
+      WHERE e.establishment_type = 'Hospital'
+      ${estFilter}
+    `);
+
+    res.json({
+      hospitals: hospitals.rows,
+      byScheme: byScheme.rows,
+      byService: byService.rows,
+      byDisease: byDisease.rows,
+      byDistrict: byDistrict.rows,
+      totals: totals.rows[0]
+    });
+  } catch (err) {
+    console.error('Health stats error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+// ==================== HEALTH API END ====================
 
 // --- CONDUCTOR TICKETS ---
 app.post('/api/conductor/tickets', async (req, res) => {
