@@ -1755,7 +1755,8 @@ app.get('/api/queue/:queueId/patient-profile', async (req, res) => {
       `SELECT pq.*, fm.name AS patient_name, fm.relation, fm.gender, fm.date_of_birth,
               fm.blood_group, fm.allergies, fm.chronic_conditions, fm.phone AS patient_phone,
               f.family_name, f.head_worker_id, f.address AS family_address, f.district AS family_district,
-              d.name AS doctor_name, d.specialization
+              d.name AS doctor_name, d.specialization,
+              pq.vitals AS intake_vitals
        FROM patient_queue pq
        JOIN family_members fm ON fm.id = pq.family_member_id
        JOIN families f ON f.id = pq.family_id
