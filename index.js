@@ -1482,6 +1482,444 @@ app.post('/api/conductor/tickets', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+// ═══════════════════════════════════════════════════
+// FAMILY APIs
+// ═══════════════════════════════════════════════════
+
+// Lookup family by NFC card UID → returns family + all members
+app.get('/api/families/by-card/:cardUid', async (req, res) => {
+  try {
+    const rawParam = req.params.cardUid.trim();
+    const cardUid = rawParam.toUpperCase().replace(/[^A-F0-9]/g, '');
+
+    // Try finding worker by card_uid first, then by worker_id
+    let workerRes = await pool.query(
+      `SELECT id, worker_id, first_name, last_name, phone, district, card_uid
+       FROM workers WHERE UPPER(card_uid) = $1 AND is_active = true`,
+      [cardUid]
+    );
+    if (workerRes.rowCount === 0) {
+      // Fallback: try matching by worker_id (for manual search)
+      workerRes = await pool.query(
+        `SELECT id, worker_id, first_name, last_name, phone, district, card_uid
+         FROM workers WHERE worker_id = $1 AND is_active = true`,
+        [rawParam]
+      );
+    }
+    if (workerRes.rowCount === 0) {
+      return res.status(404).json({ error: 'No worker found with this card' });
+    }
+    const worker = workerRes.rows[0];
+
+    // Find family for this worker
+    const familyRes = await pool.query(
+      `SELECT id, family_name, address, district, phone
+       FROM families WHERE head_worker_id = $1`,
+      [worker.id]
+    );
+    if (familyRes.rowCount === 0) {
+      return res.status(404).json({ error: 'No family registered for this card holder' });
+    }
+    const family = familyRes.rows[0];
+
+    // Get all family members
+    const membersRes = await pool.query(
+      `SELECT id, name, relation, gender, date_of_birth, aadhaar_last_four,
+              blood_group, allergies, chronic_conditions, phone, photo_url, is_active
+       FROM family_members WHERE family_id = $1 AND is_active = true
+       ORDER BY CASE relation
+         WHEN 'SELF' THEN 1 WHEN 'SPOUSE' THEN 2 WHEN 'FATHER' THEN 3
+         WHEN 'MOTHER' THEN 4 WHEN 'SON' THEN 5 WHEN 'DAUGHTER' THEN 6
+         ELSE 7 END`,
+      [family.id]
+    );
+
+    res.json({
+      worker: { id: worker.id, worker_id: worker.worker_id, name: `${worker.first_name} ${worker.last_name || ''}`.trim() },
+      family: { ...family, members: membersRes.rows }
+    });
+  } catch (e) {
+    console.error('Error looking up family by card:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get all members of a family
+app.get('/api/families/:familyId/members', async (req, res) => {
+  try {
+    const { familyId } = req.params;
+    const membersRes = await pool.query(
+      `SELECT id, name, relation, gender, date_of_birth, aadhaar_last_four,
+              blood_group, allergies, chronic_conditions, phone, photo_url, is_active
+       FROM family_members WHERE family_id = $1 AND is_active = true
+       ORDER BY CASE relation
+         WHEN 'SELF' THEN 1 WHEN 'SPOUSE' THEN 2 WHEN 'FATHER' THEN 3
+         WHEN 'MOTHER' THEN 4 WHEN 'SON' THEN 5 WHEN 'DAUGHTER' THEN 6
+         ELSE 7 END`,
+      [familyId]
+    );
+    res.json({ members: membersRes.rows });
+  } catch (e) {
+    console.error('Error fetching family members:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════
+// DOCTOR APIs
+// ═══════════════════════════════════════════════════
+
+// List active doctors at a hospital
+app.get('/api/doctors', async (req, res) => {
+  try {
+    const { establishment_id } = req.query;
+    let query = `
+      SELECT d.id, d.name, d.email, d.specialization, d.qualification,
+             d.experience_years, d.phone, d.photo_url, d.is_active,
+             (SELECT COUNT(*) FROM patient_queue pq
+              WHERE pq.doctor_id = d.id AND pq.status IN ('WAITING','IN_CONSULTATION')
+              AND DATE(pq.queued_at) = CURRENT_DATE) AS queue_count
+      FROM doctors d WHERE d.is_active = true
+    `;
+    const params = [];
+    if (establishment_id) {
+      params.push(establishment_id);
+      query += ` AND d.establishment_id = $${params.length}`;
+    }
+    query += ` ORDER BY d.specialization, d.name`;
+
+    const result = await pool.query(query, params);
+    res.json({ doctors: result.rows });
+  } catch (e) {
+    console.error('Error fetching doctors:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get doctor profile by ID
+app.get('/api/doctors/:doctorId', async (req, res) => {
+  try {
+    const { doctorId } = req.params;
+    const result = await pool.query(
+      `SELECT d.*, e.name AS hospital_name
+       FROM doctors d
+       LEFT JOIN establishments e ON e.id = d.establishment_id
+       WHERE d.id = $1`,
+      [doctorId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Doctor not found' });
+    res.json(result.rows[0]);
+  } catch (e) {
+    console.error('Error fetching doctor:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get logged-in doctor's profile by auth user ID
+app.get('/api/doctors/me/:authUserId', async (req, res) => {
+  try {
+    const { authUserId } = req.params;
+    const result = await pool.query(
+      `SELECT d.*, e.name AS hospital_name
+       FROM doctors d
+       LEFT JOIN establishments e ON e.id = d.establishment_id
+       WHERE d.auth_user_id = $1`,
+      [authUserId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Doctor profile not found' });
+    res.json(result.rows[0]);
+  } catch (e) {
+    console.error('Error fetching doctor profile:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════
+// PATIENT QUEUE APIs
+// ═══════════════════════════════════════════════════
+
+// Employee adds patient to doctor's queue
+app.post('/api/queue/add', async (req, res) => {
+  try {
+    const { doctor_id, family_member_id, family_id, establishment_id, added_by, notes, vitals } = req.body;
+
+    if (!doctor_id || !family_member_id || !family_id) {
+      return res.status(400).json({ error: 'doctor_id, family_member_id, and family_id are required' });
+    }
+
+    // Ensure vitals column exists
+    await pool.query(`ALTER TABLE patient_queue ADD COLUMN IF NOT EXISTS vitals JSONB`);
+
+    // Calculate token number (max token for this doctor today + 1)
+    const tokenRes = await pool.query(
+      `SELECT COALESCE(MAX(token_number), 0) + 1 AS next_token
+       FROM patient_queue
+       WHERE doctor_id = $1 AND DATE(queued_at) = CURRENT_DATE`,
+      [doctor_id]
+    );
+    const tokenNumber = tokenRes.rows[0].next_token;
+
+    const result = await pool.query(
+      `INSERT INTO patient_queue (doctor_id, family_member_id, family_id, establishment_id, token_number, added_by, notes, vitals)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [doctor_id, family_member_id, family_id, establishment_id || null, tokenNumber, added_by || null, notes || null, vitals ? JSON.stringify(vitals) : null]
+    );
+
+    // Fetch patient and doctor names for the response
+    const patientRes = await pool.query(`SELECT name, relation FROM family_members WHERE id = $1`, [family_member_id]);
+    const doctorRes = await pool.query(`SELECT name, specialization FROM doctors WHERE id = $1`, [doctor_id]);
+
+    res.json({
+      success: true,
+      queue_entry: result.rows[0],
+      token_number: tokenNumber,
+      patient_name: patientRes.rows[0]?.name,
+      doctor_name: doctorRes.rows[0]?.name,
+      doctor_specialization: doctorRes.rows[0]?.specialization
+    });
+  } catch (e) {
+    console.error('Error adding to queue:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get doctor's queue for a date
+app.get('/api/queue/doctor/:doctorId', async (req, res) => {
+  try {
+    const { doctorId } = req.params;
+    const date = req.query.date || new Date().toISOString().split('T')[0];
+
+    const result = await pool.query(
+      `SELECT pq.*, fm.name AS patient_name, fm.relation, fm.gender, fm.date_of_birth,
+              fm.blood_group, fm.allergies, fm.chronic_conditions,
+              f.family_name, f.head_worker_id, pq.vitals AS intake_vitals
+       FROM patient_queue pq
+       JOIN family_members fm ON fm.id = pq.family_member_id
+       JOIN families f ON f.id = pq.family_id
+       WHERE pq.doctor_id = $1 AND DATE(pq.queued_at) = $2
+       ORDER BY pq.token_number ASC`,
+      [doctorId, date]
+    );
+
+    // Queue summary
+    const waiting = result.rows.filter(r => r.status === 'WAITING').length;
+    const inConsultation = result.rows.filter(r => r.status === 'IN_CONSULTATION').length;
+    const completed = result.rows.filter(r => r.status === 'COMPLETED').length;
+
+    res.json({
+      queue: result.rows,
+      summary: { total: result.rows.length, waiting, in_consultation: inConsultation, completed }
+    });
+  } catch (e) {
+    console.error('Error fetching doctor queue:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Doctor updates queue status
+app.patch('/api/queue/:queueId/status', async (req, res) => {
+  try {
+    const { queueId } = req.params;
+    const { status } = req.body;
+
+    const validStatuses = ['WAITING', 'IN_CONSULTATION', 'COMPLETED', 'CANCELLED'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ error: `Invalid status. Must be one of: ${validStatuses.join(', ')}` });
+    }
+
+    let extraFields = '';
+    if (status === 'IN_CONSULTATION') extraFields = ', called_at = NOW()';
+    if (status === 'COMPLETED' || status === 'CANCELLED') extraFields = ', completed_at = NOW()';
+
+    const result = await pool.query(
+      `UPDATE patient_queue SET status = $1 ${extraFields} WHERE id = $2 RETURNING *`,
+      [status, queueId]
+    );
+
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Queue entry not found' });
+    res.json({ success: true, queue_entry: result.rows[0] });
+  } catch (e) {
+    console.error('Error updating queue status:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get full patient profile for a queue entry
+app.get('/api/queue/:queueId/patient-profile', async (req, res) => {
+  try {
+    const { queueId } = req.params;
+
+    // Get queue entry with patient details
+    const queueRes = await pool.query(
+      `SELECT pq.*, fm.name AS patient_name, fm.relation, fm.gender, fm.date_of_birth,
+              fm.blood_group, fm.allergies, fm.chronic_conditions, fm.phone AS patient_phone,
+              f.family_name, f.head_worker_id, f.address AS family_address, f.district AS family_district,
+              d.name AS doctor_name, d.specialization
+       FROM patient_queue pq
+       JOIN family_members fm ON fm.id = pq.family_member_id
+       JOIN families f ON f.id = pq.family_id
+       JOIN doctors d ON d.id = pq.doctor_id
+       WHERE pq.id = $1`,
+      [queueId]
+    );
+    if (queueRes.rowCount === 0) return res.status(404).json({ error: 'Queue entry not found' });
+
+    const entry = queueRes.rows[0];
+
+    // Get past prescriptions for this patient
+    const prescriptionsRes = await pool.query(
+      `SELECT ep.*, d.name AS doctor_name, d.specialization
+       FROM e_prescriptions ep
+       JOIN doctors d ON d.id = ep.doctor_id
+       WHERE ep.family_member_id = $1
+       ORDER BY ep.created_at DESC LIMIT 20`,
+      [entry.family_member_id]
+    );
+
+    // Get all family members
+    const familyMembersRes = await pool.query(
+      `SELECT id, name, relation, gender, date_of_birth, blood_group, allergies, chronic_conditions, phone
+       FROM family_members WHERE family_id = $1 AND is_active = true
+       ORDER BY CASE relation WHEN 'SELF' THEN 1 WHEN 'SPOUSE' THEN 2 WHEN 'FATHER' THEN 3
+         WHEN 'MOTHER' THEN 4 WHEN 'SON' THEN 5 WHEN 'DAUGHTER' THEN 6 ELSE 7 END`,
+      [entry.family_id]
+    );
+
+    // Get head worker details (card_uid, scheme, photo, etc.)
+    let workerInfo = null;
+    if (entry.head_worker_id) {
+      const workerRes = await pool.query(
+        `SELECT worker_id, first_name, last_name, phone, district, mandal, card_uid,
+                photo_url, blood_group AS head_blood_group, scheme_name, gender AS head_gender,
+                dob AS head_dob, aadhaar_number
+         FROM workers WHERE id = $1`,
+        [entry.head_worker_id]
+      );
+      if (workerRes.rowCount > 0) workerInfo = workerRes.rows[0];
+    }
+
+    // Get worker health records if family head
+    let healthRecords = [];
+    if (entry.head_worker_id) {
+      const recordsRes = await pool.query(
+        `SELECT hr.*, e.name AS hospital_name
+         FROM hospital_records hr
+         LEFT JOIN establishments e ON e.id = hr.establishment_id
+         WHERE hr.worker_id = $1
+         ORDER BY hr.created_at DESC LIMIT 20`,
+        [entry.head_worker_id]
+      );
+      healthRecords = recordsRes.rows;
+    }
+
+    // Get past queue visits for this patient
+    const pastVisitsRes = await pool.query(
+      `SELECT pq.queued_at, pq.status, pq.notes, pq.token_number,
+              d.name AS doctor_name, d.specialization
+       FROM patient_queue pq
+       JOIN doctors d ON d.id = pq.doctor_id
+       WHERE pq.family_member_id = $1 AND pq.id != $2
+       ORDER BY pq.queued_at DESC LIMIT 10`,
+      [entry.family_member_id, queueId]
+    );
+
+    res.json({
+      patient: entry,
+      prescriptions: prescriptionsRes.rows,
+      health_records: healthRecords,
+      family_members: familyMembersRes.rows,
+      worker_info: workerInfo,
+      past_visits: pastVisitsRes.rows
+    });
+  } catch (e) {
+    console.error('Error fetching patient profile:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════
+// E-PRESCRIPTION APIs
+// ═══════════════════════════════════════════════════
+
+// Doctor creates e-prescription
+app.post('/api/prescriptions', async (req, res) => {
+  try {
+    const { queue_id, doctor_id, family_member_id, establishment_id,
+            diagnosis, symptoms, vitals, medicines, tests_recommended, advice, follow_up_date } = req.body;
+
+    if (!doctor_id || !family_member_id) {
+      return res.status(400).json({ error: 'doctor_id and family_member_id are required' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO e_prescriptions (queue_id, doctor_id, family_member_id, establishment_id,
+         diagnosis, symptoms, vitals, medicines, tests_recommended, advice, follow_up_date)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       RETURNING *`,
+      [queue_id || null, doctor_id, family_member_id, establishment_id || null,
+       diagnosis, symptoms, vitals ? JSON.stringify(vitals) : null,
+       medicines ? JSON.stringify(medicines) : null, tests_recommended, advice, follow_up_date || null]
+    );
+
+    // If queue_id provided, mark queue entry as COMPLETED
+    if (queue_id) {
+      await pool.query(
+        `UPDATE patient_queue SET status = 'COMPLETED', completed_at = NOW() WHERE id = $1`,
+        [queue_id]
+      );
+    }
+
+    res.json({ success: true, prescription: result.rows[0] });
+  } catch (e) {
+    console.error('Error creating prescription:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get all prescriptions for a patient
+app.get('/api/prescriptions/patient/:familyMemberId', async (req, res) => {
+  try {
+    const { familyMemberId } = req.params;
+    const result = await pool.query(
+      `SELECT ep.*, d.name AS doctor_name, d.specialization, e.name AS hospital_name
+       FROM e_prescriptions ep
+       JOIN doctors d ON d.id = ep.doctor_id
+       LEFT JOIN establishments e ON e.id = ep.establishment_id
+       WHERE ep.family_member_id = $1
+       ORDER BY ep.created_at DESC`,
+      [familyMemberId]
+    );
+    res.json({ prescriptions: result.rows });
+  } catch (e) {
+    console.error('Error fetching prescriptions:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get single prescription by ID
+app.get('/api/prescriptions/:prescriptionId', async (req, res) => {
+  try {
+    const { prescriptionId } = req.params;
+    const result = await pool.query(
+      `SELECT ep.*, d.name AS doctor_name, d.specialization, d.qualification,
+              e.name AS hospital_name, fm.name AS patient_name, fm.gender, fm.date_of_birth,
+              fm.blood_group, fm.allergies, fm.chronic_conditions
+       FROM e_prescriptions ep
+       JOIN doctors d ON d.id = ep.doctor_id
+       LEFT JOIN establishments e ON e.id = ep.establishment_id
+       JOIN family_members fm ON fm.id = ep.family_member_id
+       WHERE ep.id = $1`,
+      [prescriptionId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Prescription not found' });
+    res.json(result.rows[0]);
+  } catch (e) {
+    console.error('Error fetching prescription:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // HTTPS Setup (Conditional for Local Dev - Vercel handles HTTPS automatically)
 let httpsOptions = {};
 try {
