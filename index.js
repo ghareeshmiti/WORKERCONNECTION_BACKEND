@@ -33,6 +33,9 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// Run lightweight migrations on startup (safe to re-run)
+pool.query(`ALTER TABLE patient_queue ADD COLUMN IF NOT EXISTS vitals JSONB`).catch(() => {});
+
 // Initialize Supabase Admin (for Auth)
 const supabaseUrl = process.env.SUPABASE_URL || 'https://seecqtxhpsostjniabeo.supabase.co';
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -1646,9 +1649,6 @@ app.post('/api/queue/add', async (req, res) => {
     if (!doctor_id || !family_member_id || !family_id) {
       return res.status(400).json({ error: 'doctor_id, family_member_id, and family_id are required' });
     }
-
-    // Ensure vitals column exists
-    await pool.query(`ALTER TABLE patient_queue ADD COLUMN IF NOT EXISTS vitals JSONB`);
 
     // Calculate token number (max token for this doctor today + 1)
     const tokenRes = await pool.query(
