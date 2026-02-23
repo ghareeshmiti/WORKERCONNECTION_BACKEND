@@ -1458,6 +1458,44 @@ app.get('/api/health/stats', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+// GET /api/health/alerts - Disease hotspot data for map
+app.get('/api/health/alerts', async (req, res) => {
+  try {
+    // Get individual records with worker location info for map dots
+    const result = await pool.query(`
+      SELECT hr.id, hr.diagnosis, hr.service_type, hr.scheme_name, hr.cost, hr.govt_paid,
+             hr.created_at, w.first_name, w.last_name, w.gender, w.dob,
+             w.district, w.mandal, w.village,
+             e.name AS hospital_name
+      FROM hospital_records hr
+      JOIN workers w ON hr.worker_id = w.id
+      LEFT JOIN establishments e ON hr.establishment_id = e.id
+      WHERE hr.diagnosis IS NOT NULL
+      ORDER BY hr.created_at DESC
+      LIMIT 500
+    `);
+
+    // Disease hotspot summary: group by disease + mandal
+    const hotspots = await pool.query(`
+      SELECT hr.diagnosis, w.district, w.mandal, COUNT(*) AS case_count,
+             MAX(hr.created_at) AS latest_case
+      FROM hospital_records hr
+      JOIN workers w ON hr.worker_id = w.id
+      WHERE hr.diagnosis IS NOT NULL
+      GROUP BY hr.diagnosis, w.district, w.mandal
+      ORDER BY case_count DESC
+    `);
+
+    res.json({
+      records: result.rows,
+      hotspots: hotspots.rows,
+    });
+  } catch (err) {
+    console.error('Health alerts error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ==================== HEALTH API END ====================
 
 // --- CONDUCTOR TICKETS ---
@@ -1497,14 +1535,14 @@ app.get('/api/families/by-card/:cardUid', async (req, res) => {
 
     // Try finding worker by card_uid first, then by worker_id
     let workerRes = await pool.query(
-      `SELECT id, worker_id, first_name, last_name, phone, district, card_uid
+      `SELECT id, worker_id, first_name, last_name, phone, district, card_uid, gender, dob
        FROM workers WHERE UPPER(card_uid) = $1 AND is_active = true`,
       [cardUid]
     );
     if (workerRes.rowCount === 0) {
       // Fallback: try matching by worker_id (for manual search)
       workerRes = await pool.query(
-        `SELECT id, worker_id, first_name, last_name, phone, district, card_uid
+        `SELECT id, worker_id, first_name, last_name, phone, district, card_uid, gender, dob
          FROM workers WHERE worker_id = $1 AND is_active = true`,
         [rawParam]
       );
@@ -1525,16 +1563,19 @@ app.get('/api/families/by-card/:cardUid', async (req, res) => {
     }
     const family = familyRes.rows[0];
 
-    // Get all family members
+    // Get all family members — for SELF member, use gender from workers table
     const membersRes = await pool.query(
-      `SELECT id, name, relation, gender, date_of_birth, aadhaar_last_four,
-              blood_group, allergies, chronic_conditions, phone, photo_url, is_active
-       FROM family_members WHERE family_id = $1 AND is_active = true
-       ORDER BY CASE relation
+      `SELECT fm.id, fm.name, fm.relation,
+              CASE WHEN fm.relation = 'SELF' THEN $2 ELSE fm.gender END AS gender,
+              COALESCE(fm.date_of_birth, CASE WHEN fm.relation = 'SELF' THEN $3::date ELSE NULL END) AS date_of_birth,
+              fm.aadhaar_last_four, fm.blood_group, fm.allergies, fm.chronic_conditions,
+              fm.phone, fm.photo_url, fm.is_active
+       FROM family_members fm WHERE fm.family_id = $1 AND fm.is_active = true
+       ORDER BY CASE fm.relation
          WHEN 'SELF' THEN 1 WHEN 'SPOUSE' THEN 2 WHEN 'FATHER' THEN 3
          WHEN 'MOTHER' THEN 4 WHEN 'SON' THEN 5 WHEN 'DAUGHTER' THEN 6
          ELSE 7 END`,
-      [family.id]
+      [family.id, worker.gender, worker.dob]
     );
 
     res.json({
@@ -1552,10 +1593,16 @@ app.get('/api/families/:familyId/members', async (req, res) => {
   try {
     const { familyId } = req.params;
     const membersRes = await pool.query(
-      `SELECT id, name, relation, gender, date_of_birth, aadhaar_last_four,
-              blood_group, allergies, chronic_conditions, phone, photo_url, is_active
-       FROM family_members WHERE family_id = $1 AND is_active = true
-       ORDER BY CASE relation
+      `SELECT fm.id, fm.name, fm.relation,
+              CASE WHEN fm.relation = 'SELF' AND w.gender IS NOT NULL THEN w.gender ELSE fm.gender END AS gender,
+              COALESCE(fm.date_of_birth, CASE WHEN fm.relation = 'SELF' THEN w.dob ELSE NULL END) AS date_of_birth,
+              fm.aadhaar_last_four, fm.blood_group, fm.allergies, fm.chronic_conditions,
+              fm.phone, fm.photo_url, fm.is_active
+       FROM family_members fm
+       JOIN families f ON f.id = fm.family_id
+       LEFT JOIN workers w ON w.id = f.head_worker_id AND fm.relation = 'SELF'
+       WHERE fm.family_id = $1 AND fm.is_active = true
+       ORDER BY CASE fm.relation
          WHEN 'SELF' THEN 1 WHEN 'SPOUSE' THEN 2 WHEN 'FATHER' THEN 3
          WHEN 'MOTHER' THEN 4 WHEN 'SON' THEN 5 WHEN 'DAUGHTER' THEN 6
          ELSE 7 END`,
@@ -1691,12 +1738,15 @@ app.get('/api/queue/doctor/:doctorId', async (req, res) => {
     const date = req.query.date || new Date().toISOString().split('T')[0];
 
     const result = await pool.query(
-      `SELECT pq.*, fm.name AS patient_name, fm.relation, fm.gender, fm.date_of_birth,
+      `SELECT pq.*, fm.name AS patient_name, fm.relation,
+              CASE WHEN fm.relation = 'SELF' AND w.gender IS NOT NULL THEN w.gender ELSE fm.gender END AS gender,
+              COALESCE(fm.date_of_birth, CASE WHEN fm.relation = 'SELF' THEN w.dob ELSE NULL END) AS date_of_birth,
               fm.blood_group, fm.allergies, fm.chronic_conditions,
               f.family_name, f.head_worker_id, pq.vitals AS intake_vitals
        FROM patient_queue pq
        JOIN family_members fm ON fm.id = pq.family_member_id
        JOIN families f ON f.id = pq.family_id
+       LEFT JOIN workers w ON w.id = f.head_worker_id AND fm.relation = 'SELF'
        WHERE pq.doctor_id = $1 AND DATE(pq.queued_at) = $2
        ORDER BY pq.token_number ASC`,
       [doctorId, date]
@@ -1752,7 +1802,9 @@ app.get('/api/queue/:queueId/patient-profile', async (req, res) => {
 
     // Get queue entry with patient details
     const queueRes = await pool.query(
-      `SELECT pq.*, fm.name AS patient_name, fm.relation, fm.gender, fm.date_of_birth,
+      `SELECT pq.*, fm.name AS patient_name, fm.relation,
+              CASE WHEN fm.relation = 'SELF' AND w.gender IS NOT NULL THEN w.gender ELSE fm.gender END AS gender,
+              COALESCE(fm.date_of_birth, CASE WHEN fm.relation = 'SELF' THEN w.dob ELSE NULL END) AS date_of_birth,
               fm.blood_group, fm.allergies, fm.chronic_conditions, fm.phone AS patient_phone,
               f.family_name, f.head_worker_id, f.address AS family_address, f.district AS family_district,
               d.name AS doctor_name, d.specialization,
@@ -1761,6 +1813,7 @@ app.get('/api/queue/:queueId/patient-profile', async (req, res) => {
        JOIN family_members fm ON fm.id = pq.family_member_id
        JOIN families f ON f.id = pq.family_id
        JOIN doctors d ON d.id = pq.doctor_id
+       LEFT JOIN workers w ON w.id = f.head_worker_id AND fm.relation = 'SELF'
        WHERE pq.id = $1`,
       [queueId]
     );
@@ -1778,11 +1831,17 @@ app.get('/api/queue/:queueId/patient-profile', async (req, res) => {
       [entry.family_member_id]
     );
 
-    // Get all family members
+    // Get all family members — use worker gender for SELF
     const familyMembersRes = await pool.query(
-      `SELECT id, name, relation, gender, date_of_birth, blood_group, allergies, chronic_conditions, phone
-       FROM family_members WHERE family_id = $1 AND is_active = true
-       ORDER BY CASE relation WHEN 'SELF' THEN 1 WHEN 'SPOUSE' THEN 2 WHEN 'FATHER' THEN 3
+      `SELECT fm.id, fm.name, fm.relation,
+              CASE WHEN fm.relation = 'SELF' AND w2.gender IS NOT NULL THEN w2.gender ELSE fm.gender END AS gender,
+              COALESCE(fm.date_of_birth, CASE WHEN fm.relation = 'SELF' THEN w2.dob ELSE NULL END) AS date_of_birth,
+              fm.blood_group, fm.allergies, fm.chronic_conditions, fm.phone
+       FROM family_members fm
+       JOIN families f2 ON f2.id = fm.family_id
+       LEFT JOIN workers w2 ON w2.id = f2.head_worker_id AND fm.relation = 'SELF'
+       WHERE fm.family_id = $1 AND fm.is_active = true
+       ORDER BY CASE fm.relation WHEN 'SELF' THEN 1 WHEN 'SPOUSE' THEN 2 WHEN 'FATHER' THEN 3
          WHEN 'MOTHER' THEN 4 WHEN 'SON' THEN 5 WHEN 'DAUGHTER' THEN 6 ELSE 7 END`,
       [entry.family_id]
     );
