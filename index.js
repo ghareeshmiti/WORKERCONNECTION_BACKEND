@@ -54,6 +54,8 @@ const pool = new Pool({
 
 // Run lightweight migrations on startup (safe to re-run)
 pool.query(`ALTER TABLE patient_queue ADD COLUMN IF NOT EXISTS vitals JSONB`).catch(() => {});
+pool.query(`CREATE TABLE IF NOT EXISTS pending_challenges (challenge TEXT PRIMARY KEY, created_at BIGINT NOT NULL)`).catch(() => {});
+pool.query(`ALTER TABLE authenticators ADD COLUMN IF NOT EXISTS rpid TEXT`).catch(() => {});
 
 // Initialize Supabase Admin (for Auth)
 const supabaseUrl = process.env.SUPABASE_URL || 'https://seecqtxhpsostjniabeo.supabase.co';
@@ -139,14 +141,15 @@ async function getUserAuthenticators(username) {
 
 async function saveAuthenticator(username, authenticator) {
   await pool.query(
-    `INSERT INTO authenticators ("credentialID", username, "credentialPublicKey", counter, transports)
-     VALUES ($1, $2, $3, $4, $5)`,
+    `INSERT INTO authenticators ("credentialID", username, "credentialPublicKey", counter, transports, rpid)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
     [
       authenticator.credentialID,
       username,
       authenticator.credentialPublicKey,
       authenticator.counter,
-      JSON.stringify(authenticator.transports)
+      JSON.stringify(authenticator.transports),
+      authenticator.rpid || null
     ]
   );
 }
@@ -393,7 +396,8 @@ app.post('/api/register/finish', async (req, res) => {
         credentialID: credIdBuffer,
         credentialPublicKey: pubKeyBuffer,
         counter,
-        transports: body.response.transports
+        transports: body.response.transports,
+        rpid: rpID
       });
 
       await updateUserChallenge(username, null);
@@ -438,11 +442,7 @@ app.post('/api/login/begin', async (req, res) => {
       transports: dev.transports,
     }));
   } else {
-    // Usernameless flow: return ALL registered credentials so Android Credential
-    // Manager can match against NFC security keys. Browsers handle empty
-    // allowCredentials natively, but Android needs explicit credential IDs
-    // to prompt for NFC security key. The user is identified after auth
-    // via the credential used + userHandle.
+    // Usernameless flow: return ALL registered credentials
     const allAuthRes = await pool.query('SELECT "credentialID", transports FROM authenticators');
     if (allAuthRes.rowCount > 0) {
       allowCredentials = allAuthRes.rows.map(row => ({
@@ -463,16 +463,30 @@ app.post('/api/login/begin', async (req, res) => {
   if (user) {
     await updateUserChallenge(username, options.challenge);
   } else {
-    pendingChallenges.set(options.challenge, { timestamp: Date.now() });
+    // Store challenge in DB so it persists across serverless instances
+    await pool.query(
+      `INSERT INTO pending_challenges (challenge, created_at) VALUES ($1, $2) ON CONFLICT (challenge) DO UPDATE SET created_at = $2`,
+      [options.challenge, Date.now()]
+    );
+    pool.query(`DELETE FROM pending_challenges WHERE created_at < $1`, [Date.now() - 5 * 60 * 1000]).catch(() => {});
+  }
+
+  // For mobile (no origin header): return all known rpIDs to try
+  // Order: stored DB rpIDs first (Vercel/registered), then EXTRA_RP_IDS env, then production
+  const reqOrigin = req.get('origin');
+  if (!reqOrigin) {
+    const rpIdRes = await pool.query(`SELECT DISTINCT rpid FROM authenticators WHERE rpid IS NOT NULL`);
+    const storedRpIds = rpIdRes.rows.map(r => r.rpid);
+    const extraRpIds = (process.env.EXTRA_RP_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+    const allRpIds = [...new Set([...storedRpIds, ...extraRpIds, 'workerconnect.miti.us'])];
+    return res.json({ ...options, rpIds: allRpIds });
   }
 
   res.json(options);
 });
 
-const pendingChallenges = new Map();
-
 app.post('/api/login/finish', async (req, res) => {
-  let { username, body, action, location } = req.body;
+  let { username, body, action, location, usedRpId } = req.body;
   let user;
   let currentChallenge;
 
@@ -502,9 +516,13 @@ app.post('/api/login/finish', async (req, res) => {
       const clientData = JSON.parse(Buffer.from(body.response.clientDataJSON, 'base64url').toString('utf8'));
       const returnedChallenge = clientData.challenge;
 
-      if (pendingChallenges.has(returnedChallenge)) {
+      // Look up challenge from DB (persists across serverless instances)
+      const challengeRes = await pool.query(
+        `DELETE FROM pending_challenges WHERE challenge = $1 AND created_at > $2 RETURNING challenge`,
+        [returnedChallenge, Date.now() - 5 * 60 * 1000]
+      );
+      if (challengeRes.rowCount > 0) {
         currentChallenge = returnedChallenge;
-        pendingChallenges.delete(returnedChallenge);
       } else {
         throw new Error('Challenge not found or expired');
       }
@@ -517,7 +535,9 @@ app.post('/api/login/finish', async (req, res) => {
 
     if (!dbAuthenticator) throw new Error('Authenticator not found');
 
-    const { rpID, origin } = getRpConfig(req);
+    let { rpID, origin } = getRpConfig(req);
+    // Mobile app sends back which rpID worked (for multi-rpID retry flow)
+    if (usedRpId && !req.get('origin')) rpID = usedRpId;
 
     // For mobile apps (Android), the origin in clientDataJSON may be
     // "android:apk-key-hash:<SHA256>" instead of a web URL.
