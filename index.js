@@ -24,7 +24,16 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+app.use(cors({
+  origin: [
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'http://localhost:3000',
+    'https://workerconnect.miti.us',
+    'https://workerconnection-frontend.vercel.app',
+  ],
+  credentials: true,
+}));
 app.use(bodyParser.json());
 
 // Initialize Postgres
@@ -1396,7 +1405,7 @@ app.get('/api/health/stats', async (req, res) => {
         COALESCE(SUM(hr.cost - hr.govt_paid), 0) as patient_paid
       FROM establishments e
       LEFT JOIN hospital_records hr ON hr.establishment_id = e.id
-      WHERE e.establishment_type = 'Hospital'
+      WHERE e.establishment_type = 'Hospital' AND e.state_tag = 'TG'
       ${establishment_id ? `AND e.id = '${establishment_id}'` : ''}
       GROUP BY e.id, e.name, e.district, e.code
       ORDER BY records DESC
@@ -1404,23 +1413,29 @@ app.get('/api/health/stats', async (req, res) => {
 
     // By scheme
     const byScheme = await pool.query(`
-      SELECT scheme_name, COUNT(*) as records, SUM(cost) as total_cost, SUM(govt_paid) as govt_paid
-      FROM hospital_records hr WHERE 1=1 ${estFilter}
-      GROUP BY scheme_name ORDER BY records DESC
+      SELECT hr.scheme_name, COUNT(*) as records, SUM(hr.cost) as total_cost, SUM(hr.govt_paid) as govt_paid
+      FROM hospital_records hr
+      JOIN establishments e ON hr.establishment_id = e.id
+      WHERE e.state_tag = 'TG' ${estFilter}
+      GROUP BY hr.scheme_name ORDER BY records DESC
     `);
 
     // By service
     const byService = await pool.query(`
-      SELECT service_type, COUNT(*) as records, SUM(cost) as total_cost
-      FROM hospital_records hr WHERE 1=1 ${estFilter}
-      GROUP BY service_type ORDER BY records DESC
+      SELECT hr.service_type, COUNT(*) as records, SUM(hr.cost) as total_cost
+      FROM hospital_records hr
+      JOIN establishments e ON hr.establishment_id = e.id
+      WHERE e.state_tag = 'TG' ${estFilter}
+      GROUP BY hr.service_type ORDER BY records DESC
     `);
 
     // By disease
     const byDisease = await pool.query(`
-      SELECT diagnosis, COUNT(*) as records, SUM(cost) as total_cost, SUM(govt_paid) as govt_paid
-      FROM hospital_records hr WHERE 1=1 ${estFilter} AND diagnosis IS NOT NULL
-      GROUP BY diagnosis ORDER BY records DESC LIMIT 15
+      SELECT hr.diagnosis, COUNT(*) as records, SUM(hr.cost) as total_cost, SUM(hr.govt_paid) as govt_paid
+      FROM hospital_records hr
+      JOIN establishments e ON hr.establishment_id = e.id
+      WHERE e.state_tag = 'TG' ${estFilter} AND hr.diagnosis IS NOT NULL
+      GROUP BY hr.diagnosis ORDER BY records DESC LIMIT 15
     `);
 
     // By district (drill-down)
@@ -1428,7 +1443,7 @@ app.get('/api/health/stats', async (req, res) => {
       SELECT e.district, COUNT(hr.id) as records, SUM(hr.cost) as total_cost, SUM(hr.govt_paid) as govt_paid
       FROM hospital_records hr
       JOIN establishments e ON hr.establishment_id = e.id
-      WHERE e.establishment_type = 'Hospital'
+      WHERE e.establishment_type = 'Hospital' AND e.state_tag = 'TG'
       ${establishment_id ? `AND e.id = '${establishment_id}'` : ''}
       GROUP BY e.district ORDER BY records DESC
     `);
@@ -1441,10 +1456,10 @@ app.get('/api/health/stats', async (req, res) => {
         COALESCE(SUM(hr.govt_paid), 0) as govt_paid
       FROM hospital_records hr
       LEFT JOIN establishments e ON hr.establishment_id = e.id
-      WHERE e.establishment_type = 'Hospital'
+      WHERE e.establishment_type = 'Hospital' AND e.state_tag = 'TG'
       ${estFilter}
     `);
-
+    // All fetching is now specific to state_tag = 'TG' via JOINs or implicit filtering above
     res.json({
       hospitals: hospitals.rows,
       byScheme: byScheme.rows,
@@ -1531,7 +1546,8 @@ app.post('/api/conductor/tickets', async (req, res) => {
 app.get('/api/families/by-card/:cardUid', async (req, res) => {
   try {
     const rawParam = req.params.cardUid.trim();
-    const cardUid = rawParam.toUpperCase().replace(/[^A-F0-9]/g, '');
+    // Normalize card UID: keep alphanumeric only (most cards are alphanumeric), to support values like WKR836...
+    const cardUid = rawParam.toUpperCase().replace(/[^A-Z0-9]/g, '');
 
     // Try finding worker by card_uid first, then by worker_id
     let workerRes = await pool.query(
@@ -1540,11 +1556,11 @@ app.get('/api/families/by-card/:cardUid', async (req, res) => {
       [cardUid]
     );
     if (workerRes.rowCount === 0) {
-      // Fallback: try matching by worker_id (for manual search)
+      // Fallback: try matching by worker_id (case-insensitive)
       workerRes = await pool.query(
         `SELECT id, worker_id, first_name, last_name, phone, district, card_uid, gender, dob
-         FROM workers WHERE worker_id = $1 AND is_active = true`,
-        [rawParam]
+         FROM workers WHERE UPPER(worker_id) = $1 AND is_active = true`,
+        [cardUid]
       );
     }
     if (workerRes.rowCount === 0) {
@@ -1553,21 +1569,47 @@ app.get('/api/families/by-card/:cardUid', async (req, res) => {
     const worker = workerRes.rows[0];
 
     // Find family for this worker
+    let family;
     const familyRes = await pool.query(
       `SELECT id, family_name, address, district, phone
        FROM families WHERE head_worker_id = $1`,
       [worker.id]
     );
+
     if (familyRes.rowCount === 0) {
-      return res.status(404).json({ error: 'No family registered for this card holder' });
+      // No family exists yet for this worker; create a minimal one so the OPD queue flow can work.
+      const familyName = `${worker.first_name} ${worker.last_name || ''}`.trim() + ' Family';
+      const insertFamily = await pool.query(
+        `INSERT INTO families (head_worker_id, family_name, address, district, phone)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, family_name, address, district, phone`,
+        [worker.id, familyName, '', worker.district || '', worker.phone || '']
+      );
+      family = insertFamily.rows[0];
+
+      // Create a SELF member record for this worker
+      const memberName = `${worker.first_name} ${worker.last_name || ''}`.trim();
+      await pool.query(
+        `INSERT INTO family_members (family_id, name, relation, gender, date_of_birth, blood_group, allergies, chronic_conditions, phone, is_active)
+         VALUES ($1, $2, 'SELF', $3, $4, $5, $6, $7, $8, true)
+         ON CONFLICT (family_id, relation) DO UPDATE
+         SET gender = EXCLUDED.gender,
+             date_of_birth = EXCLUDED.date_of_birth,
+             blood_group = EXCLUDED.blood_group,
+             allergies = EXCLUDED.allergies,
+             chronic_conditions = EXCLUDED.chronic_conditions,
+             phone = EXCLUDED.phone`,
+        [family.id, memberName, worker.gender, worker.dob, worker.blood_group, worker.allergies, worker.chronic_conditions, worker.phone]
+      );
+    } else {
+      family = familyRes.rows[0];
     }
-    const family = familyRes.rows[0];
 
     // Get all family members — for SELF member, use gender from workers table
     const membersRes = await pool.query(
       `SELECT fm.id, fm.name, fm.relation,
               CASE WHEN fm.relation = 'SELF' THEN $2 ELSE fm.gender END AS gender,
-              COALESCE(fm.date_of_birth, CASE WHEN fm.relation = 'SELF' THEN $3::date ELSE NULL END) AS date_of_birth,
+              COALESCE(fm.date_of_birth, CASE WHEN fm.relation = 'SELF' AND $3 ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN $3::date ELSE NULL END) AS date_of_birth,
               fm.aadhaar_last_four, fm.blood_group, fm.allergies, fm.chronic_conditions,
               fm.phone, fm.photo_url, fm.is_active
        FROM family_members fm WHERE fm.family_id = $1 AND fm.is_active = true
@@ -1595,7 +1637,7 @@ app.get('/api/families/:familyId/members', async (req, res) => {
     const membersRes = await pool.query(
       `SELECT fm.id, fm.name, fm.relation,
               CASE WHEN fm.relation = 'SELF' AND w.gender IS NOT NULL THEN w.gender ELSE fm.gender END AS gender,
-              COALESCE(fm.date_of_birth, CASE WHEN fm.relation = 'SELF' THEN w.dob ELSE NULL END) AS date_of_birth,
+              COALESCE(fm.date_of_birth, CASE WHEN fm.relation = 'SELF' AND w.dob ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN w.dob::date ELSE NULL END) AS date_of_birth,
               fm.aadhaar_last_four, fm.blood_group, fm.allergies, fm.chronic_conditions,
               fm.phone, fm.photo_url, fm.is_active
        FROM family_members fm
@@ -1691,10 +1733,40 @@ app.get('/api/doctors/me/:authUserId', async (req, res) => {
 // Employee adds patient to doctor's queue
 app.post('/api/queue/add', async (req, res) => {
   try {
-    const { doctor_id, family_member_id, family_id, establishment_id, added_by, notes, vitals } = req.body;
+    const { doctor_id, family_member_id, family_id, establishment_id, added_by, notes, vitals, member_name, family_name } = req.body;
 
     if (!doctor_id || !family_member_id || !family_id) {
       return res.status(400).json({ error: 'doctor_id, family_member_id, and family_id are required' });
+    }
+
+    // Check if the family_member_id exists in the local DB.
+    // If not (worker came from external health API), create minimal family + member records.
+    let resolvedFamilyMemberId = family_member_id;
+    let resolvedFamilyId = family_id;
+
+    const memberCheck = await pool.query(`SELECT id FROM family_members WHERE id = $1`, [family_member_id]);
+    if (memberCheck.rowCount === 0) {
+      // family_member_id is from external API — create local records
+      const fName = family_name || (member_name ? member_name + ' Family' : 'Unknown Family');
+      const mName = member_name || 'Unknown Patient';
+
+      // Insert or find family
+      const familyInsert = await pool.query(
+        `INSERT INTO families (family_name, address, district, phone)
+         VALUES ($1, '', '', '')
+         RETURNING id`,
+        [fName]
+      );
+      resolvedFamilyId = familyInsert.rows[0].id;
+
+      // Insert member
+      const memberInsert = await pool.query(
+        `INSERT INTO family_members (family_id, name, relation, is_active)
+         VALUES ($1, $2, 'SELF', true)
+         RETURNING id`,
+        [resolvedFamilyId, mName]
+      );
+      resolvedFamilyMemberId = memberInsert.rows[0].id;
     }
 
     // Calculate token number (max token for this doctor today + 1)
@@ -1710,11 +1782,11 @@ app.post('/api/queue/add', async (req, res) => {
       `INSERT INTO patient_queue (doctor_id, family_member_id, family_id, establishment_id, token_number, added_by, notes, vitals)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING *`,
-      [doctor_id, family_member_id, family_id, establishment_id || null, tokenNumber, added_by || null, notes || null, vitals ? JSON.stringify(vitals) : null]
+      [doctor_id, resolvedFamilyMemberId, resolvedFamilyId, establishment_id || null, tokenNumber, added_by || null, notes || null, vitals ? JSON.stringify(vitals) : null]
     );
 
     // Fetch patient and doctor names for the response
-    const patientRes = await pool.query(`SELECT name, relation FROM family_members WHERE id = $1`, [family_member_id]);
+    const patientRes = await pool.query(`SELECT name, relation FROM family_members WHERE id = $1`, [resolvedFamilyMemberId]);
     const doctorRes = await pool.query(`SELECT name, specialization FROM doctors WHERE id = $1`, [doctor_id]);
 
     res.json({
@@ -1740,7 +1812,7 @@ app.get('/api/queue/doctor/:doctorId', async (req, res) => {
     const result = await pool.query(
       `SELECT pq.*, fm.name AS patient_name, fm.relation,
               CASE WHEN fm.relation = 'SELF' AND w.gender IS NOT NULL THEN w.gender ELSE fm.gender END AS gender,
-              COALESCE(fm.date_of_birth, CASE WHEN fm.relation = 'SELF' THEN w.dob ELSE NULL END) AS date_of_birth,
+              COALESCE(fm.date_of_birth, CASE WHEN fm.relation = 'SELF' AND w.dob ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN w.dob::date ELSE NULL END) AS date_of_birth,
               fm.blood_group, fm.allergies, fm.chronic_conditions,
               f.family_name, f.head_worker_id, pq.vitals AS intake_vitals
        FROM patient_queue pq
@@ -1804,7 +1876,7 @@ app.get('/api/queue/:queueId/patient-profile', async (req, res) => {
     const queueRes = await pool.query(
       `SELECT pq.*, fm.name AS patient_name, fm.relation,
               CASE WHEN fm.relation = 'SELF' AND w.gender IS NOT NULL THEN w.gender ELSE fm.gender END AS gender,
-              COALESCE(fm.date_of_birth, CASE WHEN fm.relation = 'SELF' THEN w.dob ELSE NULL END) AS date_of_birth,
+              COALESCE(fm.date_of_birth, CASE WHEN fm.relation = 'SELF' AND w.dob ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN w.dob::date ELSE NULL END) AS date_of_birth,
               fm.blood_group, fm.allergies, fm.chronic_conditions, fm.phone AS patient_phone,
               f.family_name, f.head_worker_id, f.address AS family_address, f.district AS family_district,
               d.name AS doctor_name, d.specialization,
@@ -1835,7 +1907,7 @@ app.get('/api/queue/:queueId/patient-profile', async (req, res) => {
     const familyMembersRes = await pool.query(
       `SELECT fm.id, fm.name, fm.relation,
               CASE WHEN fm.relation = 'SELF' AND w2.gender IS NOT NULL THEN w2.gender ELSE fm.gender END AS gender,
-              COALESCE(fm.date_of_birth, CASE WHEN fm.relation = 'SELF' THEN w2.dob ELSE NULL END) AS date_of_birth,
+              COALESCE(fm.date_of_birth, CASE WHEN fm.relation = 'SELF' AND w2.dob ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN w2.dob::date ELSE NULL END) AS date_of_birth,
               fm.blood_group, fm.allergies, fm.chronic_conditions, fm.phone
        FROM family_members fm
        JOIN families f2 ON f2.id = fm.family_id
