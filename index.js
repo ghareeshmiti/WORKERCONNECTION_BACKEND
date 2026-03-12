@@ -1693,7 +1693,6 @@ app.get('/api/families/:familyId/members', async (req, res) => {
 // ═══════════════════════════════════════════════════
 // DOCTOR APIs
 // ═══════════════════════════════════════════════════
-
 // List active doctors at a hospital
 app.get('/api/doctors', async (req, res) => {
   try {
