@@ -1596,24 +1596,26 @@ app.get('/api/families/by-card/:cardUid', async (req, res) => {
         [worker.id, familyName, '', worker.district || '', worker.phone || '']
       );
       family = insertFamily.rows[0];
-
-      // Create a SELF member record for this worker
-      const memberName = `${worker.first_name} ${worker.last_name || ''}`.trim();
-      await pool.query(
-        `INSERT INTO family_members (family_id, name, relation, gender, date_of_birth, blood_group, allergies, chronic_conditions, phone, is_active)
-         VALUES ($1, $2, 'SELF', $3, $4, $5, $6, $7, $8, true)
-         ON CONFLICT (family_id, relation) DO UPDATE
-         SET gender = EXCLUDED.gender,
-             date_of_birth = EXCLUDED.date_of_birth,
-             blood_group = EXCLUDED.blood_group,
-             allergies = EXCLUDED.allergies,
-             chronic_conditions = EXCLUDED.chronic_conditions,
-             phone = EXCLUDED.phone`,
-        [family.id, memberName, worker.gender, worker.dob, worker.blood_group, worker.allergies, worker.chronic_conditions, worker.phone]
-      );
     } else {
       family = familyRes.rows[0];
     }
+
+    // Always ensure the SELF member exists (handles families created before this logic was added)
+    const memberName = `${worker.first_name} ${worker.last_name || ''}`.trim();
+    await pool.query(
+      `INSERT INTO family_members (family_id, name, relation, gender, date_of_birth, blood_group, allergies, chronic_conditions, phone, is_active)
+       VALUES ($1, $2, 'SELF', $3, $4, $5, $6, $7, $8, true)
+       ON CONFLICT (family_id, relation) DO UPDATE
+       SET name = EXCLUDED.name,
+           gender = EXCLUDED.gender,
+           date_of_birth = EXCLUDED.date_of_birth,
+           blood_group = EXCLUDED.blood_group,
+           allergies = EXCLUDED.allergies,
+           chronic_conditions = EXCLUDED.chronic_conditions,
+           phone = EXCLUDED.phone,
+           is_active = true`,
+      [family.id, memberName, worker.gender, worker.dob, worker.blood_group, worker.allergies, worker.chronic_conditions, worker.phone]
+    );
 
     // Get all family members — for SELF member, use gender from workers table
     const membersRes = await pool.query(
