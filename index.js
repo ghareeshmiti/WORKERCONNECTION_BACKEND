@@ -25,13 +25,23 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors({
-  origin: [
-    'http://localhost:5173',
-    'http://localhost:5174',
-    'http://localhost:3000',
-    'https://workerconnect.miti.us',
-    'https://workerconnection-frontend.vercel.app',
-  ],
+  origin: (origin, callback) => {
+    const allowed = [
+      'http://localhost:5173',
+      'http://localhost:5174',
+      'http://localhost:3000',
+      'https://workerconnect.miti.us',
+      'https://workerconnection-frontend.vercel.app',
+    ];
+    // Allow any Vercel preview deployments for this project
+    if (!origin || allowed.includes(origin) ||
+        /^https:\/\/workerconnection-frontend(-[a-z0-9]+-)?[^.]+\.vercel\.app$/.test(origin) ||
+        /^https:\/\/workerconnection-frontend-git-[^.]+\.vercel\.app$/.test(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true,
 }));
 app.use(bodyParser.json());
