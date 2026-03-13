@@ -1435,60 +1435,63 @@ app.get('/api/health/stats', async (req, res) => {
         COALESCE(SUM(hr.cost - hr.govt_paid), 0) as patient_paid
       FROM establishments e
       LEFT JOIN hospital_records hr ON hr.establishment_id = e.id
-      WHERE e.establishment_type = 'Hospital' AND e.state_tag = 'TG'
+      WHERE e.establishment_type = 'Hospital' 
       ${establishment_id ? `AND e.id = '${establishment_id}'` : ''}
       GROUP BY e.id, e.name, e.district, e.code
       ORDER BY records DESC
     `);
 
     // By scheme
-    const byScheme = await pool.query(`
-      SELECT hr.scheme_name, COUNT(*) as records, SUM(hr.cost) as total_cost, SUM(hr.govt_paid) as govt_paid
-      FROM hospital_records hr
-      JOIN establishments e ON hr.establishment_id = e.id
-      WHERE e.state_tag = 'TG' ${estFilter}
-      GROUP BY hr.scheme_name ORDER BY records DESC
-    `);
+  const byScheme = await pool.query(`
+  SELECT hr.scheme_name, COUNT(*) as records, SUM(hr.cost) as total_cost, SUM(hr.govt_paid) as govt_paid
+  FROM hospital_records hr
+  JOIN establishments e ON hr.establishment_id = e.id
+  ${estFilter}
+  GROUP BY hr.scheme_name
+  ORDER BY records DESC
+`);
 
     // By service
-    const byService = await pool.query(`
-      SELECT hr.service_type, COUNT(*) as records, SUM(hr.cost) as total_cost
-      FROM hospital_records hr
-      JOIN establishments e ON hr.establishment_id = e.id
-      WHERE e.state_tag = 'TG' ${estFilter}
-      GROUP BY hr.service_type ORDER BY records DESC
-    `);
+const byService = await pool.query(`
+  SELECT hr.service_type, COUNT(*) as records, SUM(hr.cost) as total_cost
+  FROM hospital_records hr
+  JOIN establishments e ON hr.establishment_id = e.id
+  WHERE 1=1 ${estFilter}
+  GROUP BY hr.service_type
+  ORDER BY records DESC
+`);
 
-    // By disease
-    const byDisease = await pool.query(`
-      SELECT hr.diagnosis, COUNT(*) as records, SUM(hr.cost) as total_cost, SUM(hr.govt_paid) as govt_paid
-      FROM hospital_records hr
-      JOIN establishments e ON hr.establishment_id = e.id
-      WHERE e.state_tag = 'TG' ${estFilter} AND hr.diagnosis IS NOT NULL
-      GROUP BY hr.diagnosis ORDER BY records DESC LIMIT 15
-    `);
-
+  const byDisease = await pool.query(`
+  SELECT hr.diagnosis, COUNT(*) as records, SUM(hr.cost) as total_cost, SUM(hr.govt_paid) as govt_paid
+  FROM hospital_records hr
+  JOIN establishments e ON hr.establishment_id = e.id
+  WHERE 1=1 ${estFilter} AND hr.diagnosis IS NOT NULL
+  GROUP BY hr.diagnosis
+  ORDER BY records DESC
+  LIMIT 15
+`);
     // By district (drill-down)
-    const byDistrict = await pool.query(`
-      SELECT e.district, COUNT(hr.id) as records, SUM(hr.cost) as total_cost, SUM(hr.govt_paid) as govt_paid
-      FROM hospital_records hr
-      JOIN establishments e ON hr.establishment_id = e.id
-      WHERE e.establishment_type = 'Hospital' AND e.state_tag = 'TG'
-      ${establishment_id ? `AND e.id = '${establishment_id}'` : ''}
-      GROUP BY e.district ORDER BY records DESC
-    `);
+const byDistrict = await pool.query(`
+  SELECT e.district, COUNT(hr.id) as records, SUM(hr.cost) as total_cost, SUM(hr.govt_paid) as govt_paid
+  FROM hospital_records hr
+  JOIN establishments e ON hr.establishment_id = e.id
+  WHERE e.establishment_type = 'Hospital'
+  ${establishment_id ? `AND e.id = '${establishment_id}'` : ''}
+  GROUP BY e.district
+  ORDER BY records DESC
+`);
 
-    // Totals
-    const totals = await pool.query(`
-      SELECT COUNT(DISTINCT hr.worker_id) as unique_patients,
-        COUNT(hr.id) as total_records,
-        COALESCE(SUM(hr.cost), 0) as total_cost,
-        COALESCE(SUM(hr.govt_paid), 0) as govt_paid
-      FROM hospital_records hr
-      LEFT JOIN establishments e ON hr.establishment_id = e.id
-      WHERE e.establishment_type = 'Hospital' AND e.state_tag = 'TG'
-      ${estFilter}
-    `);
+   // Totals
+const totals = await pool.query(`
+  SELECT COUNT(DISTINCT hr.worker_id) as unique_patients,
+    COUNT(hr.id) as total_records,
+    COALESCE(SUM(hr.cost), 0) as total_cost,
+    COALESCE(SUM(hr.govt_paid), 0) as govt_paid
+  FROM hospital_records hr
+  LEFT JOIN establishments e ON hr.establishment_id = e.id
+  WHERE e.establishment_type = 'Hospital'
+  ${estFilter}
+`);
     // All fetching is now specific to state_tag = 'TG' via JOINs or implicit filtering above
     res.json({
       hospitals: hospitals.rows,
