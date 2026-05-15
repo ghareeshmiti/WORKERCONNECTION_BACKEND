@@ -102,12 +102,12 @@ async function seedHealthData() {
 
         // 5. Seed hospital_records
         const services = [
-            { service_type: 'Consultation', diagnosis: 'Diabetes', description: 'Diabetes follow-up consultation', cost: 500, scheme: 'NTR Vaidya Seva', govt_paid: 500 },
-            { service_type: 'Pharmacy', diagnosis: 'Diabetes', description: 'Monthly diabetes medicines', cost: 1200, scheme: 'NTR Vaidya Seva', govt_paid: 1200 },
-            { service_type: 'Laboratory', diagnosis: 'Diabetes', description: 'HbA1c and blood sugar panel', cost: 800, scheme: 'NTR Vaidya Seva', govt_paid: 800 },
+            { service_type: 'Consultation', diagnosis: 'Diabetes', description: 'Diabetes follow-up consultation', cost: 500, scheme: 'State Health Scheme', govt_paid: 500 },
+            { service_type: 'Pharmacy', diagnosis: 'Diabetes', description: 'Monthly diabetes medicines', cost: 1200, scheme: 'State Health Scheme', govt_paid: 1200 },
+            { service_type: 'Laboratory', diagnosis: 'Diabetes', description: 'HbA1c and blood sugar panel', cost: 800, scheme: 'State Health Scheme', govt_paid: 800 },
             { service_type: 'Consultation', diagnosis: 'Hypertension', description: 'BP management consultation', cost: 500, scheme: 'EHS', govt_paid: 500 },
             { service_type: 'Pharmacy', diagnosis: 'Hypertension', description: 'Antihypertensive medicines', cost: 900, scheme: 'EHS', govt_paid: 900 },
-            { service_type: 'Surgery', diagnosis: 'Eye Disease', description: 'Cataract surgery - left eye', cost: 35000, scheme: 'NTR Vaidya Seva', govt_paid: 35000 },
+            { service_type: 'Surgery', diagnosis: 'Eye Disease', description: 'Cataract surgery - left eye', cost: 35000, scheme: 'State Health Scheme', govt_paid: 35000 },
             { service_type: 'Laboratory', diagnosis: 'Diabetes', description: 'Fasting blood sugar test', cost: 600, scheme: 'PMJAY', govt_paid: 600 },
             { service_type: 'Consultation', diagnosis: 'Fever', description: 'General fever consultation', cost: 300, scheme: 'Paid', govt_paid: 0 },
             { service_type: 'Laboratory', diagnosis: 'Fever', description: 'CBC and malaria test', cost: 700, scheme: 'Paid', govt_paid: 0 },

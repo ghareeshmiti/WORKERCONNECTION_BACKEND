@@ -505,13 +505,24 @@ app.post('/api/login/finish', async (req, res) => {
     } else {
       // Usernameless
       const response = body.response;
-      if (!response.userHandle) throw new Error('User handle missing in response');
 
-      const userHandleBuffer = isoBase64URL.toBuffer(response.userHandle);
-      const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [userHandleBuffer]);
-      user = userRes.rows[0];
-
-      if (!user) throw new Error('User not found from userHandle');
+      if (response.userHandle) {
+        // Standard path: card returned user handle, look up user by it
+        const userHandleBuffer = isoBase64URL.toBuffer(response.userHandle);
+        const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [userHandleBuffer]);
+        user = userRes.rows[0];
+        if (!user) throw new Error('User not found from userHandle');
+      } else {
+        // Fallback: card didn't return user handle (some FIDO2 cards omit it).
+        // Resolve user from the credential ID returned in body.id.
+        const credIdBuffer = isoBase64URL.toBuffer(body.id);
+        const authRes = await pool.query(
+          'SELECT username FROM authenticators WHERE "credentialID" = $1',
+          [credIdBuffer]
+        );
+        if (!authRes.rows[0]) throw new Error('Credential not found — please re-register your card');
+        user = await getOrCreateUser(authRes.rows[0].username);
+      }
 
       const clientData = JSON.parse(Buffer.from(body.response.clientDataJSON, 'base64url').toString('utf8'));
       const returnedChallenge = clientData.challenge;
@@ -524,7 +535,12 @@ app.post('/api/login/finish', async (req, res) => {
       if (challengeRes.rowCount > 0) {
         currentChallenge = returnedChallenge;
       } else {
-        throw new Error('Challenge not found or expired');
+        // Fallback: try user's stored challenge (for cases where challenge was stored per-user)
+        if (user.currentChallenge === returnedChallenge) {
+          currentChallenge = returnedChallenge;
+        } else {
+          throw new Error('Challenge not found or expired');
+        }
       }
     }
 
