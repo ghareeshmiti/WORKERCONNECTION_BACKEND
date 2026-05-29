@@ -1265,7 +1265,7 @@ app.delete('/api/admin/workers/:worker_id/card', async (req, res) => {
 });
 
 app.post('/api/auth/nfc-login', async (req, res) => {
-  const { cardId, uidHex } = req.body;
+  const { cardId, uidHex, action, location } = req.body;
 
   // Use card UID (hex) as the primary identifier
   const lookup = (cardId || uidHex || '').toUpperCase().trim();
