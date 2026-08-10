@@ -35,6 +35,9 @@ const pool = new Pool({
 
 // Run lightweight migrations on startup (safe to re-run)
 pool.query(`ALTER TABLE patient_queue ADD COLUMN IF NOT EXISTS vitals JSONB`).catch(() => {});
+pool.query(`CREATE TABLE IF NOT EXISTS pending_challenges (challenge TEXT PRIMARY KEY, created_at TIMESTAMP DEFAULT NOW())`).catch(() => {});
+// Clean up stale challenges older than 10 minutes on startup
+pool.query(`DELETE FROM pending_challenges WHERE created_at < NOW() - INTERVAL '10 minutes'`).catch(() => {});
 
 // Initialize Supabase Admin (for Auth)
 const supabaseUrl = process.env.SUPABASE_URL || 'https://seecqtxhpsostjniabeo.supabase.co';
@@ -444,7 +447,12 @@ app.post('/api/login/begin', async (req, res) => {
   if (user) {
     await updateUserChallenge(username, options.challenge);
   } else {
-    pendingChallenges.set(options.challenge, { timestamp: Date.now() });
+    // Store in DB so it persists across serverless invocations (Vercel)
+    await pool.query(
+      `INSERT INTO pending_challenges (challenge, created_at) VALUES ($1, NOW()) ON CONFLICT (challenge) DO NOTHING`,
+      [options.challenge]
+    ).catch(() => {});
+    pendingChallenges.set(options.challenge, { timestamp: Date.now() }); // in-memory fallback
   }
 
   res.json(options);
@@ -470,24 +478,40 @@ app.post('/api/login/finish', async (req, res) => {
       user = await getOrCreateUser(username);
       currentChallenge = user.currentChallenge;
     } else {
-      // Usernameless
+      // Usernameless flow: identify user from userHandle or credential ID
       const response = body.response;
-      if (!response.userHandle) throw new Error('User handle missing in response');
 
-      const userHandleBuffer = isoBase64URL.toBuffer(response.userHandle);
-      const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [userHandleBuffer]);
-      user = userRes.rows[0];
+      if (response.userHandle) {
+        // Primary: look up user by userHandle returned from the authenticator
+        const userHandleBuffer = isoBase64URL.toBuffer(response.userHandle);
+        const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [userHandleBuffer]);
+        user = userRes.rows[0];
+      }
 
-      if (!user) throw new Error('User not found from userHandle');
+      if (!user) {
+        // Fallback: look up user by credential ID (valid when card omits userHandle)
+        const credBuffer = isoBase64URL.toBuffer(body.id);
+        const authRes = await pool.query('SELECT username FROM authenticators WHERE "credentialID" = $1', [credBuffer]);
+        if (authRes.rows.length > 0) {
+          const userRes = await pool.query('SELECT * FROM users WHERE username = $1', [authRes.rows[0].username]);
+          user = userRes.rows[0];
+        }
+      }
+
+      if (!user) throw new Error('User not found from NFC card credential');
 
       const clientData = JSON.parse(Buffer.from(body.response.clientDataJSON, 'base64url').toString('utf8'));
       const returnedChallenge = clientData.challenge;
 
-      if (pendingChallenges.has(returnedChallenge)) {
+      // Try DB-stored challenge first (works across serverless instances), then in-memory fallback
+      const dbChallenge = await pool.query('DELETE FROM pending_challenges WHERE challenge = $1 RETURNING challenge', [returnedChallenge]).catch(() => ({ rowCount: 0 }));
+      if (dbChallenge.rowCount > 0) {
+        currentChallenge = returnedChallenge;
+      } else if (pendingChallenges.has(returnedChallenge)) {
         currentChallenge = returnedChallenge;
         pendingChallenges.delete(returnedChallenge);
       } else {
-        throw new Error('Challenge not found or expired');
+        throw new Error('Challenge not found or expired. Please try again.');
       }
     }
 
